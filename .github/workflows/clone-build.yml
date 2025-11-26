@@ -73,7 +73,7 @@ jobs:
         if: steps.check.outputs.trigger_build == 'true'
         uses: gradle/actions/setup-gradle@v4
 
-      # 4. 【修正】Pythonで丸アイコン生成 (エラー回避)
+      # 4. Pythonで丸アイコン生成
       - name: Generate Round Icon
         if: steps.check.outputs.trigger_build == 'true'
         run: |
@@ -100,7 +100,7 @@ jobs:
             echo "icon.png not found, skipping generation."
           fi
 
-      # 5. 【修正】Metrolist Neo化 & アイコン置換
+      # 5. Metrolist Neo化 & アイコン置換
       - name: Modify for Clone (JavaScript)
         if: steps.check.outputs.trigger_build == 'true'
         uses: actions/github-script@v7
@@ -175,10 +175,9 @@ jobs:
                     if (content !== original) fs.writeFileSync(filePath, content, 'utf8');
                 }
                 
-                // strings.xml (アプリ名変更 - 正規表現強化版)
+                // strings.xml (アプリ名変更)
                 if (filePath.endsWith('strings.xml')) {
                     let content = fs.readFileSync(filePath, 'utf8');
-                    // <string name="app_name" ... >Metrolist</string> を確実に捕まえる
                     const regex = /(<string name="app_name"[^>]*>)(.*?)(<\/string>)/g;
                     if (regex.test(content)) {
                         console.log(`Renaming app name in ${filePath}`);
@@ -208,10 +207,10 @@ jobs:
           mkdir -p output_apks
           find app/build/outputs/apk -name "*.apk" -type f -exec cp {} output_apks/ \;
 
-      # 8. 署名
+      # 8. 署名 (ここを変更：最新版のActionを使用)
       - name: Sign APK
         if: steps.check.outputs.trigger_build == 'true'
-        uses: r0adkll/sign-android-release@v1
+        uses: ilharp/sign-android-release@v1
         id: sign_app
         with:
           releaseDirectory: output_apks
@@ -232,8 +231,6 @@ jobs:
           body: |
             Automated clone build based on upstream version ${{ steps.check.outputs.release_tag }}.
             Package Name: `com.metrolist.clone`
-            App Name: `Metrolist Neo`
-            Note: Custom Round Icon included.
           files: output_apks/*-signed.apk
           draft: false
           prerelease: false
