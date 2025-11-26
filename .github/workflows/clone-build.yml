@@ -11,7 +11,7 @@ permissions:
 jobs:
   build:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 45 # 念のため時間を延長
 
     steps:
       # ---------------------------------------------------------
@@ -23,11 +23,11 @@ jobs:
           fetch-depth: 0
 
       # ---------------------------------------------------------
-      # 2. 環境構築 (Java 21に変更)
+      # 2. 環境構築 (Java 21)
       # ---------------------------------------------------------
       - uses: actions/setup-java@v4
         with:
-          java-version: '21'  # ここを17から21へ変更
+          java-version: '21'
           distribution: 'temurin'
       
       - uses: actions/setup-python@v5
@@ -73,7 +73,7 @@ jobs:
           if [ -f /tmp/icon.png ]; then mv /tmp/icon.png icon.png; fi
 
       # ---------------------------------------------------------
-      # 4. 改造スクリプト (Java 21のまま維持するよう修正)
+      # 4. 改造スクリプト (メモリ設定・R8設定を注入)
       # ---------------------------------------------------------
       - name: Apply Modifications
         if: steps.check.outputs.trigger == 'true'
@@ -83,7 +83,6 @@ jobs:
           cat << 'EOF' > modify.py
           import os
           import shutil
-          import glob
           import re
           from PIL import Image, ImageOps
 
@@ -103,11 +102,9 @@ jobs:
                   print(f'Processing {ICON_SRC}...')
                   img = Image.open(ICON_SRC).convert('RGBA')
                   
-                  # 背景色抽出
                   p = img.resize((1, 1)).getpixel((0, 0))
                   bg_hex = '#{:02x}{:02x}{:02x}'.format(*p[:3]) if p[3] > 0 else '#000000'
 
-                  # 前景画像
                   size = 1080
                   target = int(size * 0.65)
                   canvas = Image.new('RGBA', (size, size), (0, 0, 0, 0))
@@ -154,21 +151,27 @@ jobs:
               with open('app/google-services.json', 'w') as f:
                   f.write('{"project_info":{"project_number":"0","project_id":"d"},"client":[{"client_info":{"mobilesdk_app_id":"1:0:a:0","android_client_info":{"package_name":"' + APP_ID + '"}},"api_key":[{"current_key":"d"}]}]}')
 
+              # gradle.properties を生成してメモリ設定とR8設定を注入
+              # これがクラッシュ回避のキモ
+              properties_content = """
+          org.gradle.jvmargs=-Xmx3072m -XX:MaxMetaspaceSize=1g -Xss4m -XX:+HeapDumpOnOutOfMemoryError -Dfile.encoding=UTF-8
+          android.useAndroidX=true
+          android.enableJetifier=true
+          android.enableR8.fullMode=false
+          """
+              with open('gradle.properties', 'w') as f:
+                  f.write(properties_content)
+              print("gradle.properties Created with Memory Settings.")
+
               # build.gradle.kts
               g_path = 'app/build.gradle.kts'
               if os.path.exists(g_path):
                   with open(g_path, 'r') as f: c = f.read()
                   
-                  # 1. ID変更
                   c = re.sub(r'applicationId\s*=\s*"[^"]*"', f'applicationId = "{APP_ID}"', c)
-                  
-                  # 2. Plugin無効化
                   c = re.sub(r'(.*alias\(libs\.plugins\.google\.services\).*)', r'// \1', c)
                   c = re.sub(r'(.*id\(\"com\.google\.gms\.google-services\"\).*)', r'// \1', c)
 
-                  # 3. Javaバージョンダウングレード処理は削除 (Java 21環境に合わせるため不要)
-                  
-                  # 4. アプリ名 & 背景色 の注入
                   if 'defaultConfig {' in c:
                       inj = f'defaultConfig {{ \n resValue("string", "app_name", "{APP_NAME}") \n resValue("color", "ic_launcher_background_gradle", "{bg_hex}")'
                       c = c.replace('defaultConfig {', inj)
@@ -200,11 +203,11 @@ jobs:
         if: steps.check.outputs.trigger == 'true'
         run: chmod +x gradlew
 
-      # 5. ビルド (stacktrace追加とメモリ制限の明示)
+      # 5. ビルド
+      # メモリ設定は gradle.properties で行うため、ここでは引数をシンプルにする
       - name: Build APK
         if: steps.check.outputs.trigger == 'true'
-        # Gradleのメモリを2GBに制限し、詳細ログを出すように変更
-        run: ./gradlew clean assembleRelease --no-configuration-cache --stacktrace -Dorg.gradle.jvmargs="-Xmx2048m"
+        run: ./gradlew clean assembleRelease --no-configuration-cache --stacktrace --no-daemon
         env:
           GITHUB_EVENT_NAME: pull_request
           LASTFM_API_KEY: "dummy"
