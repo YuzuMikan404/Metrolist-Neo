@@ -58,7 +58,7 @@ jobs:
         if: steps.check.outputs.trigger_build == 'true'
         uses: gradle/actions/setup-gradle@v4
 
-      # 4. 【安定版】JSスクリプトによるクローン化処理
+      # 4. クローン化処理（JSスクリプト）
       - name: Modify for Clone (JavaScript)
         if: steps.check.outputs.trigger_build == 'true'
         uses: actions/github-script@v7
@@ -70,7 +70,7 @@ jobs:
             function walkDir(dir, callback) {
                 fs.readdirSync(dir).forEach(f => {
                     let dirPath = path.join(dir, f);
-                    if (f === '.git') return; // .gitフォルダは無視
+                    if (f === '.git') return; 
                     let isDirectory = fs.statSync(dirPath).isDirectory();
                     isDirectory ? walkDir(dirPath, callback) : callback(path.join(dir, f));
                 });
@@ -78,7 +78,7 @@ jobs:
 
             console.log("Starting modification...");
 
-            // 1. ダミーの google-services.json を作成 (ファイル欠損エラー回避)
+            // 1. ダミーの google-services.json を作成
             const dummyJson = {
               "project_info": { "project_number": "000000000000", "project_id": "dummy", "storage_bucket": "dummy" },
               "client": [{
@@ -87,11 +87,9 @@ jobs:
               }]
             };
             fs.writeFileSync('app/google-services.json', JSON.stringify(dummyJson));
-            console.log("Created dummy google-services.json");
 
             // 2. ファイルの書き換え
             walkDir('.', function(filePath) {
-                // build.gradle.kts の修正
                 if (filePath.endsWith('build.gradle.kts')) {
                     let content = fs.readFileSync(filePath, 'utf8');
                     let original = content;
@@ -99,7 +97,7 @@ jobs:
                     // applicationId (ID) を変更
                     content = content.replace(/applicationId\s*=\s*"[^"]*"/g, 'applicationId = "com.metrolist.clone"');
                     
-                    // Google Services Plugin をコメントアウト (エラー回避)
+                    // Google Services Plugin をコメントアウト
                     content = content.replace(/(.*alias\(libs\.plugins\.google\.services\).*)/g, '// $1');
                     content = content.replace(/(.*id\("com\.google\.gms\.google-services"\).*)/g, '// $1');
 
@@ -108,8 +106,6 @@ jobs:
                         console.log(`Modified: ${filePath}`);
                     }
                 }
-                
-                // アプリ名の変更
                 if (filePath.endsWith('strings.xml')) {
                     let content = fs.readFileSync(filePath, 'utf8');
                     if (content.includes('>Metrolist<')) {
@@ -128,21 +124,33 @@ jobs:
       # 5. ビルド実行
       - name: Build Release APK
         if: steps.check.outputs.trigger_build == 'true'
-        # GITHUB_EVENT_NAME: pull_request を偽装することで、
-        # 署名設定(signingConfig)が自動的に "debug" に切り替わり、エラーが消えます。
+        # PRモード(署名設定バイパス)でビルド
         run: ./gradlew assembleRelease --no-configuration-cache -x lint -x test --stacktrace
         env:
           GITHUB_EVENT_NAME: pull_request
           LASTFM_API_KEY: "dummy_value"
           LASTFM_SECRET: "dummy_value"
 
-      # 6. APK署名 (自分の鍵で署名し直す)
+      # 6. 【追加】APKの回収
+      #    バラバラの場所にあるAPKを output_apks フォルダに一箇所に集めます
+      - name: Collect APKs
+        if: steps.check.outputs.trigger_build == 'true'
+        run: |
+          mkdir -p output_apks
+          echo "Searching for APKs..."
+          # app/build/outputs/apk 以下の全ての .apk ファイルを探してコピー
+          find app/build/outputs/apk -name "*.apk" -type f -exec cp {} output_apks/ \;
+          
+          echo "Collected APKs:"
+          ls -l output_apks/
+
+      # 7. APK署名 (output_apks 内のファイルを署名)
       - name: Sign APK
         if: steps.check.outputs.trigger_build == 'true'
         uses: r0adkll/sign-android-release@v1
         id: sign_app
         with:
-          releaseDirectory: app/build/outputs/apk/release
+          releaseDirectory: output_apks
           signingKeyBase64: ${{ secrets.SIGNING_KEY }}
           alias: ${{ secrets.ALIAS }}
           keyStorePassword: ${{ secrets.KEY_STORE_PASSWORD }}
@@ -150,7 +158,7 @@ jobs:
         env:
           BUILD_TOOLS_VERSION: "34.0.0"
 
-      # 7. リリース作成
+      # 8. リリース作成
       - name: Create Release
         if: steps.check.outputs.trigger_build == 'true'
         uses: softprops/action-gh-release@v2
@@ -161,7 +169,7 @@ jobs:
             Automated clone build based on upstream version ${{ steps.check.outputs.release_tag }}.
             Package Name: `com.metrolist.clone`
             Original: https://github.com/mostafaalagamy/Metrolist/releases/tag/${{ steps.check.outputs.release_tag }}
-          files: ${{ steps.sign_app.outputs.signedReleaseFile }}
+          files: output_apks/*-signed.apk
           draft: false
           prerelease: false
         env:
