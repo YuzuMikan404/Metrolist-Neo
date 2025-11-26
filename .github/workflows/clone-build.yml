@@ -17,7 +17,7 @@ jobs:
         with:
           fetch-depth: 0
 
-      # 1. オリジナルの最新リリースタグを取得し、自分のリポジトリと比較
+      # 1. オリジナルの最新リリースを確認
       - name: Check for new release
         id: check
         env:
@@ -58,35 +58,38 @@ jobs:
         if: steps.check.outputs.trigger_build == 'true'
         uses: gradle/actions/setup-gradle@v4
 
-      # 4. クローン化処理（ここを修正：フォルダ移動を追加）
+      # 4. クローン化処理（ここを修正：エラーが出ない安全な書き方に変更）
       - name: Modify for Clone
         if: steps.check.outputs.trigger_build == 'true'
         run: |
           echo "Applying clone modifications..."
 
-          # --- [追加修正] データベース定義フォルダの移動 ---
-          # コード内のパッケージ名を music -> clone に変えると、Roomはこのフォルダを探しに行きます。
-          # そのため、フォルダもリネーム（コピー）してあげる必要があります。
+          # --- Roomデータベース定義フォルダの移動 ---
           if [ -d "app/schemas/com.metrolist.music.db.InternalDatabase" ]; then
             echo "Migrating Room schemas..."
             mkdir -p app/schemas/com.metrolist.clone.db.InternalDatabase
             cp -r app/schemas/com.metrolist.music.db.InternalDatabase/* app/schemas/com.metrolist.clone.db.InternalDatabase/
           fi
-          # ----------------------------------------------
-
-          # 1. パッケージ名(ID)の書き換え
-          find . -name "build.gradle.kts" -print0 | xargs -0 sed -i 's/com.metrolist.music/com.metrolist.clone/g'
-          find . -name "build.gradle" -print0 | xargs -0 sed -i 's/com.metrolist.music/com.metrolist.clone/g'
           
-          # 2. ソースコード内のパッケージ書き換え
-          find app/src/main -type f -name "*.kt" -print0 | xargs -0 sed -i 's/com.metrolist.music/com.metrolist.clone/g'
-          find app/src/main -type f -name "*.xml" -print0 | xargs -0 sed -i 's/com.metrolist.music/com.metrolist.clone/g'
+          # --- 安全な置換処理 (ファイルがある場合のみ実行) ---
+          
+          # build.gradle.kts (存在すれば置換)
+          find . -name "build.gradle.kts" -exec sed -i 's/com.metrolist.music/com.metrolist.clone/g' {} + || true
+          
+          # build.gradle (存在すれば置換)
+          find . -name "build.gradle" -exec sed -i 's/com.metrolist.music/com.metrolist.clone/g' {} + || true
+          
+          # Kotlinソースファイル
+          find app/src/main -type f -name "*.kt" -exec sed -i 's/com.metrolist.music/com.metrolist.clone/g' {} + || true
+          
+          # XMLファイル
+          find app/src/main -type f -name "*.xml" -exec sed -i 's/com.metrolist.music/com.metrolist.clone/g' {} + || true
 
-          # 3. アプリ名の変更
-          sed -i 's/>Metrolist</>Metrolist Clone</g' app/src/main/res/values/strings.xml
+          # アプリ名の変更
+          sed -i 's/>Metrolist</>Metrolist Clone</g' app/src/main/res/values/strings.xml || true
 
-          # 4. 署名設定の無効化（エラー回避）
-          find . -name "build.gradle.kts" -print0 | xargs -0 sed -i 's/signingConfig =/\/\/ signingConfig =/g'
+          # 署名設定の無効化
+          find . -name "build.gradle.kts" -exec sed -i 's/signingConfig =/\/\/ signingConfig =/g' {} + || true
 
           echo "Modification complete."
 
@@ -97,7 +100,6 @@ jobs:
       # 5. ビルド実行
       - name: Build Release APK
         if: steps.check.outputs.trigger_build == 'true'
-        # エラーが出やすいチェック(lint)とテスト(test)はスキップ
         run: ./gradlew assembleRelease -x lint -x test --stacktrace
         env:
           LASTFM_API_KEY: "dummy_value"
