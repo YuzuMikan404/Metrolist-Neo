@@ -1,5 +1,5 @@
 <div align="center">
-<img src="[https://github.com/YuzuMikan404/Metrolist-Neo/blob/main/icon.png]"/>
+<img src="https://github.com/YuzuMikan404/Metrolist-Neo/blob/main/icon.png"/>
 <h1>Metrolist Neo</h1>
 <p>Metrolistの更新がリリースされるごとにリリースされるパッケージ名だけ変えた自分用アプリ。中身は一緒です。</p>
 
