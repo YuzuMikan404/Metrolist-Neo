@@ -1,13 +1,8 @@
 name: Monitor Upstream Release and Build
 
 on:
+  # ここをシンプルに修正（これでボタンが確実に復活します）
   workflow_dispatch:
-    inputs:
-      force_rebuild:
-        description: 'Force Rebuild'
-        required: false
-        default: 'true'
-        type: boolean
   schedule:
     - cron: '0 * * * *'
 
@@ -26,7 +21,7 @@ jobs:
         with:
           fetch-depth: 0
 
-      # 2. 更新チェック
+      # 2. バージョン確認
       - name: Check Updates
         id: check
         env:
@@ -35,12 +30,15 @@ jobs:
           UPSTREAM_TAG=$(gh api repos/mostafaalagamy/Metrolist/releases/latest --jq .tag_name)
           echo "Target: $UPSTREAM_TAG"
           
+          # 手動実行 (workflow_dispatch) なら強制的に再構築
           if [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
-            echo "Manual Trigger: Rebuilding..."
+            echo "Manual Trigger: Cleaning up..."
             gh release delete "$UPSTREAM_TAG" --yes --cleanup-tag || true
             git push --delete origin "$UPSTREAM_TAG" || true
             echo "trigger=true" >> $GITHUB_OUTPUT
             echo "tag=$UPSTREAM_TAG" >> $GITHUB_OUTPUT
+            
+          # 定期実行なら更新がある時だけ
           elif ! git rev-parse "$UPSTREAM_TAG" >/dev/null 2>&1; then
             echo "New version found."
             echo "trigger=true" >> $GITHUB_OUTPUT
@@ -56,11 +54,19 @@ jobs:
         run: |
           git config user.name "GH Action"
           git config user.email "action@github.com"
+          
           [ -f icon.png ] && cp icon.png /tmp/icon.png
+          
           git remote add upstream https://github.com/mostafaalagamy/Metrolist.git
           git fetch upstream --tags
           git checkout -b build-${{ steps.check.outputs.tag }} refs/tags/${{ steps.check.outputs.tag }}
-          if [ -f /tmp/icon.png ]; then mv /tmp/icon.png icon.png; fi
+          
+          if [ -f /tmp/icon.png ]; then
+            mv /tmp/icon.png icon.png
+            echo "Icon restored."
+          else
+            echo "WARNING: icon.png not found!"
+          fi
 
       # 4. 環境セットアップ
       - if: steps.check.outputs.trigger == 'true'
@@ -68,15 +74,17 @@ jobs:
         with:
           java-version: '21'
           distribution: 'temurin'
+      
       - if: steps.check.outputs.trigger == 'true'
         uses: actions/setup-python@v5
         with:
           python-version: '3.x'
+
       - if: steps.check.outputs.trigger == 'true'
         uses: gradle/actions/setup-gradle@v4
 
-      # 5. 【安全版】アイコン入替 & コード修正
-      - name: Safe Modification (Python)
+      # 5. アイコン処理 & コード修正 (Python一括処理)
+      - name: Process All (Python)
         if: steps.check.outputs.trigger == 'true'
         run: |
           pip install Pillow
@@ -85,6 +93,7 @@ jobs:
           import os
           import shutil
           import re
+          import glob
           from PIL import Image, ImageOps
           
           ICON_SRC = 'icon.png'
@@ -98,12 +107,12 @@ jobs:
               try:
                   img = Image.open(ICON_SRC).convert('RGBA')
                   
-                  # 1. 背景色抽出
+                  # 背景色抽出
                   p = img.getpixel((0, 0))
                   bg_hex = '#{:02x}{:02x}{:02x}'.format(*p[:3]) if p[3] > 0 else '#000000'
                   print(f'Detected BG: {bg_hex}')
                   
-                  # 2. アダプティブ用前景 (70%サイズで中央配置)
+                  # アダプティブ用前景 (70%サイズで中央配置)
                   size = 1080
                   target = int(size * 0.70)
                   canvas = Image.new('RGBA', (size, size), (0, 0, 0, 0))
@@ -112,25 +121,18 @@ jobs:
                   canvas.paste(resized, (off, off), resized)
                   canvas.save('ic_foreground_gen.png')
                   
-                  # 3. レガシー用
+                  # レガシー用
                   img.save('ic_legacy_gen.png')
 
-                  # 4. 【安全な削除】ic_launcherだけを狙い撃ち
-                  print('--- Replacing icons safely ---')
+                  # 【安全な削除】ic_launcherのみ削除
+                  print('--- Replacing icons ---')
                   for root, dirs, files in os.walk(RES_ROOT):
-                      # 安全装置: 'res'フォルダの中だけを対象にする
-                      if '/res' not in root.replace(os.sep, '/'):
-                          continue
-                          
+                      if '/res' not in root.replace(os.sep, '/'): continue
                       for file in files:
-                          # 'ic_launcher' が名前に含まれるファイルだけ消す
-                          # (tv_banner等は名前に含まれないので消えない！)
                           if 'ic_launcher' in file:
-                              path = os.path.join(root, file)
-                              os.remove(path)
-                              print(f'Removed old icon: {path}')
+                              os.remove(os.path.join(root, file))
                   
-                  # 5. 新しいリソース配置
+                  # 新しいリソース配置
                   main_res = 'app/src/main/res'
                   anydpi = os.path.join(main_res, 'mipmap-anydpi-v26')
                   legacy = os.path.join(main_res, 'mipmap-xxxhdpi')
@@ -140,7 +142,7 @@ jobs:
                   os.makedirs(legacy, exist_ok=True)
                   os.makedirs(values, exist_ok=True)
 
-                  # XML定義 (背景色 + 前景画像)
+                  # XML定義
                   xml = f'''<?xml version=\"1.0\" encoding=\"utf-8\"?>
           <adaptive-icon xmlns:android=\"http://schemas.android.com/apk/res/android\">
               <background android:drawable=\"{bg_hex}\" />
@@ -150,53 +152,44 @@ jobs:
                   with open(os.path.join(anydpi, 'ic_launcher.xml'), 'w') as f: f.write(xml)
                   with open(os.path.join(anydpi, 'ic_launcher_round.xml'), 'w') as f: f.write(xml)
                   
-                  # 画像コピー
+                  # 画像配置
                   shutil.copy('ic_foreground_gen.png', os.path.join(legacy, 'ic_launcher_foreground.png'))
                   shutil.copy('ic_legacy_gen.png', os.path.join(legacy, 'ic_launcher.png'))
                   shutil.copy('ic_legacy_gen.png', os.path.join(legacy, 'ic_launcher_round.png'))
-                  print('Icon updated successfully.')
+                  print('Icon done.')
 
               except Exception as e:
-                  print(f'Icon Error: {e}')
-                  # アイコンエラーでもビルドは止めない
+                  print(f'Icon Warning: {e}')
           else:
-              print('Warning: icon.png not found.')
+              print('No icon.png found. Skipping icon replacement.')
 
           # --- B. コード書き換え ---
           # ダミーJSON
           dummy = '''{\"project_info\":{\"project_number\":\"0\",\"project_id\":\"d\"},\"client\":[{\"client_info\":{\"mobilesdk_app_id\":\"1:0:a:0\",\"android_client_info\":{\"package_name\":\"''' + APP_ID + '''\"}},\"api_key\":[{\"current_key\":\"d\"}]}]}'''
           with open('app/google-services.json', 'w') as f: f.write(dummy)
 
-          # Gradle修正
-          gradle_path = 'app/build.gradle.kts'
-          if os.path.exists(gradle_path):
-              with open(gradle_path, 'r') as f: c = f.read()
+          # Gradle
+          g_path = 'app/build.gradle.kts'
+          if os.path.exists(g_path):
+              with open(g_path, 'r') as f: c = f.read()
               c = c.replace('com.metrolist.music', APP_ID)
-              # プラグイン無効化
               c = re.sub(r'(.*alias\(libs\.plugins\.google\.services\).*)', r'// \1', c)
               c = re.sub(r'(.*id\(\"com\.google\.gms\.google-services\"\).*)', r'// \1', c)
-              with open(gradle_path, 'w') as f: f.write(c)
-              print('Gradle patched.')
+              with open(g_path, 'w') as f: f.write(c)
+              print('Gradle updated.')
 
-          # Manifest修正
-          manifest_path = 'app/src/main/AndroidManifest.xml'
-          if os.path.exists(manifest_path):
-              with open(manifest_path, 'r') as f: c = f.read()
-              
-              # 名前強制
+          # Manifest
+          m_path = 'app/src/main/AndroidManifest.xml'
+          if os.path.exists(m_path):
+              with open(m_path, 'r') as f: c = f.read()
               c = re.sub(r'android:label=\"[^\"]*\"', f'android:label=\"{APP_NAME}\"', c)
-              
-              # アイコン参照先強制 (@mipmap/ic_launcher)
-              # 削除したファイル名と同じ名前で再配置しているので、リンク切れは起きない
               c = re.sub(r'android:icon=\"[^\"]*\"', 'android:icon=\"@mipmap/ic_launcher\"', c)
-              
               if 'android:roundIcon=' in c:
                   c = re.sub(r'android:roundIcon=\"[^\"]*\"', 'android:roundIcon=\"@mipmap/ic_launcher_round\"', c)
               else:
                   c = c.replace('<application', '<application android:roundIcon=\"@mipmap/ic_launcher_round\"')
-              
-              with open(manifest_path, 'w') as f: f.write(c)
-              print('Manifest patched.')
+              with open(m_path, 'w') as f: f.write(c)
+              print('Manifest updated.')
           "
 
       - name: Grant permissions
@@ -213,7 +206,7 @@ jobs:
           LASTFM_SECRET: "dummy"
 
       # 7. 回収・署名・リリース
-      - name: Collect and Release
+      - name: Collect APKs
         if: steps.check.outputs.trigger == 'true'
         run: |
           mkdir -p output_apks
