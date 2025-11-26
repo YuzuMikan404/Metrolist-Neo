@@ -71,14 +71,14 @@ jobs:
           find . -name "build.gradle" -exec sed -i 's/applicationId "com.metrolist.music"/applicationId "com.metrolist.clone"/' {} + || true
 
           # ---------------------------------------------------------
-          # 2. Google Services対策 (これがエラーの主犯)
-          #    設定ファイル(google-services.json)がある場合、中身のIDも書き換える
+          # 2. Google Services対策
+          #    jsonファイル内のIDも書き換える
           # ---------------------------------------------------------
           find . -name "google-services.json" -exec sed -i 's/com.metrolist.music/com.metrolist.clone/g' {} + || true
 
-          # プラグイン自体も可能な限り無効化を試みる (正規表現を強化)
-          find . -name "build.gradle.kts" -exec sed -i 's/alias(.*google.*services.*/\/\/ &/' {} + || true
-          find . -name "build.gradle.kts" -exec sed -i 's/id(.*google.*services.*/\/\/ &/' {} + || true
+          # プラグイン自体を無効化してエラーを防ぐ
+          find . -name "build.gradle.kts" -exec sed -i 's/alias(libs.plugins.google.services)/\/\/ alias(libs.plugins.google.services)/g' {} + || true
+          find . -name "build.gradle.kts" -exec sed -i 's/id("com.google.gms.google-services")/\/\/ id("com.google.gms.google-services")/g' {} + || true
 
           # ---------------------------------------------------------
           # 3. アプリ名の変更
@@ -86,9 +86,11 @@ jobs:
           sed -i 's/>Metrolist</>Metrolist Clone</g' app/src/main/res/values/strings.xml || true
 
           # ---------------------------------------------------------
-          # 4. 署名設定の無効化
+          # 4. 【ここを修正】署名設定の無効化
+          #    コメントアウトすると構文が壊れるため、「val ignored = ...」に置き換えて
+          #    設定を無効化しつつ、Kotlinの文法として成立させるテクニックを使います。
           # ---------------------------------------------------------
-          find . -name "build.gradle.kts" -exec sed -i 's/signingConfig =/\/\/ signingConfig =/g' {} + || true
+          find . -name "build.gradle.kts" -exec sed -i 's/signingConfig =/val ignored =/g' {} + || true
 
           echo "Modification complete."
 
@@ -99,8 +101,7 @@ jobs:
       # 5. ビルド実行
       - name: Build Release APK
         if: steps.check.outputs.trigger_build == 'true'
-        # --no-configuration-cache: キャッシュ起因のエラーを防ぐ
-        # -x lint -x test: 余計なチェックをスキップ
+        # キャッシュ無効化オプションをつけて安定させる
         run: ./gradlew assembleRelease --no-configuration-cache -x lint -x test --stacktrace
         env:
           LASTFM_API_KEY: "dummy_value"
