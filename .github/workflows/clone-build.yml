@@ -42,7 +42,7 @@ jobs:
           git config user.name "GitHub Action"
           git config user.email "action@github.com"
           
-          # カスタムアイコンを退避
+          # カスタムアイコン(icon.png)を一時退避
           cp icon.png /tmp/custom_icon.png || echo "No custom icon found."
 
           git remote add upstream https://github.com/mostafaalagamy/Metrolist.git
@@ -67,7 +67,7 @@ jobs:
         if: steps.check.outputs.trigger_build == 'true'
         uses: gradle/actions/setup-gradle@v4
 
-      # 4. 【改造】Metrolist Neo化 & 強力なアイコン置換
+      # 4. 【改造】Metrolist Neo化 & アイコン強制置換
       - name: Modify for Clone (JavaScript)
         if: steps.check.outputs.trigger_build == 'true'
         uses: actions/github-script@v7
@@ -76,35 +76,33 @@ jobs:
             const fs = require('fs');
             const path = require('path');
 
-            // --- アイコン強制置換処理 ---
+            // --- アイコン強制置換 (WebP/XML対策) ---
             if (fs.existsSync('icon.png')) {
                 console.log("Custom icon found. Replacing...");
                 const iconPath = 'icon.png';
                 const resPath = 'app/src/main/res';
                 
-                // mipmapフォルダを走査
                 if (fs.existsSync(resPath)) {
                     const dirs = fs.readdirSync(resPath).filter(name => name.startsWith('mipmap-'));
                     
                     dirs.forEach(dirName => {
                         const dirPath = path.join(resPath, dirName);
                         
-                        // "anydpi" フォルダにはXML形式のアイコン定義が入っており、
-                        // これが残っていると画像(png)よりも優先されてしまうため、関連ファイルを削除して無効化する。
+                        // "anydpi" (アダプティブアイコン定義) は画像置換の邪魔になるので削除
                         if (dirName.includes('anydpi')) {
                              const files = fs.readdirSync(dirPath);
                              files.forEach(file => {
                                  if (file.startsWith('ic_launcher')) {
                                      fs.unlinkSync(path.join(dirPath, file));
-                                     console.log(`Removed adaptive icon config: ${path.join(dirName, file)}`);
+                                     console.log(`Removed adaptive icon config: ${file}`);
                                  }
                              });
                              return; 
                         }
 
-                        // 通常の画像フォルダ (mdpi, hdpi, xhdpi...)
+                        // 画像フォルダ (mdpi, hdpi, xhdpi...)
                         ['ic_launcher', 'ic_launcher_round'].forEach(baseName => {
-                            // 1. 既存のアイコン(webp, png, xml)を徹底的に削除
+                            // 1. 既存のアイコン(webp, png, xml)を削除
                             ['.webp', '.png', '.xml'].forEach(ext => {
                                 const existing = path.join(dirPath, baseName + ext);
                                 if (fs.existsSync(existing)) {
@@ -112,14 +110,12 @@ jobs:
                                 }
                             });
                             
-                            // 2. 自分の png をコピーして配置
+                            // 2. 自分の png をコピー
                             fs.copyFileSync(iconPath, path.join(dirPath, baseName + '.png'));
                         });
                     });
-                    console.log("Icon replacement complete (WebP/Adaptive removed).");
+                    console.log("Icon replacement complete.");
                 }
-            } else {
-                console.log("WARNING: icon.png not found. Skipping icon replacement.");
             }
             // ---------------------------
 
@@ -132,7 +128,7 @@ jobs:
                 });
             }
 
-            // ダミーjson作成
+            // ダミーの google-services.json 作成
             const dummyJson = {
               "project_info": { "project_number": "000000000000", "project_id": "dummy", "storage_bucket": "dummy" },
               "client": [{
@@ -170,6 +166,7 @@ jobs:
                     }
                 }
             });
+            console.log("Modification complete.");
 
       - name: Grant execute permission for gradlew
         if: steps.check.outputs.trigger_build == 'true'
@@ -178,9 +175,10 @@ jobs:
       # 5. ビルド実行
       - name: Build Release APK
         if: steps.check.outputs.trigger_build == 'true'
+        # GITHUB_EVENT_NAME: pull_request を指定して署名エラー回避
         run: ./gradlew assembleRelease --no-configuration-cache -x lint -x test --stacktrace
         env:
-          GITHUB_EVENT_NAME: pull_request # 署名回避マジック
+          GITHUB_EVENT_NAME: pull_request
           LASTFM_API_KEY: "dummy_value"
           LASTFM_SECRET: "dummy_value"
 
@@ -205,13 +203,13 @@ jobs:
         env:
           BUILD_TOOLS_VERSION: "34.0.0"
 
-      # 8. リリース作成
+      # 8. リリース作成 (ここを修正しました)
       - name: Create Release
         if: steps.check.outputs.trigger_build == 'true'
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ steps.check.outputs.release_tag }}
-          # タイトル変更: Metrolist Neo v...
+          # ▼ タイトルを Metrolist Neo に変更
           name: Metrolist Neo ${{ steps.check.outputs.release_tag }}
           body: |
             Automated clone build based on upstream version ${{ steps.check.outputs.release_tag }}.
