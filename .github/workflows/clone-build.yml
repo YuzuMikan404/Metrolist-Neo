@@ -1,7 +1,7 @@
 name: Build Metrolist Neo
 
 on:
-  workflow_dispatch: # 手動実行用
+  workflow_dispatch:
   schedule:
     - cron: '0 * * * *'
 
@@ -11,16 +11,15 @@ permissions:
 jobs:
   build:
     runs-on: ubuntu-latest
-    timeout-minutes: 40
+    timeout-minutes: 30
 
     steps:
-      # 1. チェックアウト
       - name: Checkout
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      # 2. 環境構築 (Java 17)
+      # 1. Java 17 (ビルドエラー回避のため必須)
       - uses: actions/setup-java@v4
         with:
           java-version: '17'
@@ -32,7 +31,7 @@ jobs:
       
       - uses: gradle/actions/setup-gradle@v4
 
-      # 3. バージョンチェックとソース取得
+      # 2. ソース取得
       - name: Check and Fetch
         id: check
         env:
@@ -42,143 +41,137 @@ jobs:
           echo "Target: $TAG"
           
           if [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
-            # 手動時はクリーンアップして実行
             gh release delete "$TAG" --yes --cleanup-tag || true
             git push --delete origin "$TAG" || true
             echo "trigger=true" >> $GITHUB_OUTPUT
             echo "tag=$TAG" >> $GITHUB_OUTPUT
           elif ! git rev-parse "$TAG" >/dev/null 2>&1; then
-            # 更新があれば実行
             echo "trigger=true" >> $GITHUB_OUTPUT
             echo "tag=$TAG" >> $GITHUB_OUTPUT
           else
             echo "trigger=false" >> $GITHUB_OUTPUT
           fi
 
-      - name: Fetch Source Code
+      - name: Fetch Code
         if: steps.check.outputs.trigger == 'true'
         run: |
-          git config user.name "Action"
+          git config user.name "GH Action"
           git config user.email "action@github.com"
           if [ -f icon.png ]; then cp icon.png /tmp/icon.png; fi
-          
           git remote add upstream https://github.com/mostafaalagamy/Metrolist.git
           git fetch upstream --tags
           git checkout -b build-${{ steps.check.outputs.tag }} refs/tags/${{ steps.check.outputs.tag }}
-          
           if [ -f /tmp/icon.png ]; then mv /tmp/icon.png icon.png; fi
 
-      # 4. 改造処理 (Pythonスクリプトファイルの生成と実行)
-      - name: Apply Modifications
+      # 3. 改造処理 (ここが最重要修正ポイント)
+      - name: Modify (Python)
         if: steps.check.outputs.trigger == 'true'
         run: |
           pip install Pillow
-          
-          # YAMLのインデントエラーを防ぐため、ヒアドキュメントの書き方を一番安全な形にします
+
           cat << 'EOF' > modify.py
           import os
-          import re
           import shutil
+          import re
           from PIL import Image, ImageOps
 
+          # 設定
           APP_ID = "com.metrolist.clone"
           APP_NAME = "Metrolist Neo"
-          ICON_SRC = "icon.png"
           
-          def process_icon():
-              if not os.path.exists(ICON_SRC):
-                  print("No icon found.")
-                  return
+          # A. アイコン処理 (成功しているのでそのまま)
+          if os.path.exists('icon.png'):
               try:
-                  # 画像処理
-                  img = Image.open(ICON_SRC).convert("RGBA")
+                  print('Processing Icon...')
+                  img = Image.open('icon.png').convert('RGBA')
                   p = img.getpixel((0, 0))
-                  bg_hex = '#{:02x}{:02x}{:02x}'.format(*p[:3]) if p[3] > 0 else '#000000'
+                  bg = '#{:02x}{:02x}{:02x}'.format(*p[:3]) if p[3] > 0 else '#000000'
                   
                   size = 1080
                   target = int(size * 0.65)
-                  canvas = Image.new("RGBA", (size, size), (0, 0, 0, 0))
+                  canvas = Image.new('RGBA', (size, size), (0, 0, 0, 0))
                   resized = ImageOps.fit(img, (target, target), centering=(0.5, 0.5))
-                  offset = (size - target) // 2
-                  canvas.paste(resized, (offset, offset), resized)
-                  canvas.save("ic_fg.png")
-                  img.save("ic_legacy.png")
+                  off = (size - target) // 2
+                  canvas.paste(resized, (off, off), resized)
+                  canvas.save('ic_fg.png')
+                  img.save('ic_legacy.png')
 
-                  # アイコン削除 (安全策: ic_launcher* のみ)
-                  for root, dirs, files in os.walk("app/src/main/res"):
+                  # 既存アイコン削除
+                  for root, dirs, files in os.walk('app/src/main/res'):
                       for f in files:
-                          if "ic_launcher" in f:
+                          if 'ic_launcher' in f:
                               os.remove(os.path.join(root, f))
-
-                  # 配置
-                  base = "app/src/main/res"
-                  os.makedirs(f"{base}/mipmap-anydpi-v26", exist_ok=True)
-                  os.makedirs(f"{base}/mipmap-xxxhdpi", exist_ok=True)
-                  os.makedirs(f"{base}/values", exist_ok=True)
-
-                  xml = f'<?xml version="1.0" encoding="utf-8"?><adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android"><background android:drawable="@color/ic_launcher_background"/><foreground android:drawable="@mipmap/ic_launcher_foreground"/></adaptive-icon>'
-                  with open(f"{base}/mipmap-anydpi-v26/ic_launcher.xml", "w") as f: f.write(xml)
-                  with open(f"{base}/mipmap-anydpi-v26/ic_launcher_round.xml", "w") as f: f.write(xml)
                   
-                  colors = f'<?xml version="1.0" encoding="utf-8"?><resources><color name="ic_launcher_background">{bg_hex}</color></resources>'
-                  with open(f"{base}/values/ic_launcher_background.xml", "w") as f: f.write(colors)
+                  # フォルダ作成
+                  base = 'app/src/main/res'
+                  anydpi = f'{base}/mipmap-anydpi-v26'
+                  legacy = f'{base}/mipmap-xxxhdpi'
+                  values = f'{base}/values'
+                  for d in [anydpi, legacy, values]: os.makedirs(d, exist_ok=True)
 
-                  shutil.copy("ic_fg.png", f"{base}/mipmap-xxxhdpi/ic_launcher_foreground.png")
-                  shutil.copy("ic_legacy.png", f"{base}/mipmap-xxxhdpi/ic_launcher.png")
-                  shutil.copy("ic_legacy.png", f"{base}/mipmap-xxxhdpi/ic_launcher_round.png")
-                  print("Icon updated.")
-              except Exception as e:
-                  print(e)
+                  # XML
+                  xml = f'''<?xml version="1.0" encoding="utf-8"?>
+          <adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">
+              <background android:drawable="@color/ic_launcher_background"/>
+              <foreground android:drawable="@mipmap/ic_launcher_foreground"/>
+          </adaptive-icon>'''
+                  with open(f'{anydpi}/ic_launcher.xml', 'w') as f: f.write(xml)
+                  with open(f'{anydpi}/ic_launcher_round.xml', 'w') as f: f.write(xml)
 
-          def process_code():
-              # ダミーJSON
-              with open("app/google-services.json", "w") as f:
-                  f.write('{"project_info":{"project_number":"0","project_id":"d"},"client":[{"client_info":{"mobilesdk_app_id":"1:0:a:0","android_client_info":{"package_name":"' + APP_ID + '"}},"api_key":[{"current_key":"d"}]}]}')
+                  # Colors
+                  cols = f'''<?xml version="1.0" encoding="utf-8"?><resources><color name="ic_launcher_background">{bg}</color></resources>'''
+                  with open(f'{values}/ic_launcher_background.xml', 'w') as f: f.write(cols)
 
-              # Gradle修正
-              # 【重要】単純置換はしない。applicationIdの設定箇所だけを正規表現で狙い撃ちする。
-              g_path = "app/build.gradle.kts"
-              if os.path.exists(g_path):
-                  with open(g_path, "r") as f: c = f.read()
+                  # Images
+                  shutil.copy('ic_fg.png', f'{legacy}/ic_launcher_foreground.png')
+                  shutil.copy('ic_legacy.png', f'{legacy}/ic_launcher.png')
+                  shutil.copy('ic_legacy.png', f'{legacy}/ic_launcher_round.png')
+                  print("Icon Updated.")
+              except: pass
+
+          # B. コード修正 (ここを修正！)
+          # ダミーJSON
+          with open('app/google-services.json', 'w') as f:
+              f.write('{"project_info":{"project_number":"0","project_id":"d"},"client":[{"client_info":{"mobilesdk_app_id":"1:0:a:0","android_client_info":{"package_name":"' + APP_ID + '"}},"api_key":[{"current_key":"d"}]}]}')
+
+          # build.gradle.kts
+          path = 'app/build.gradle.kts'
+          if os.path.exists(path):
+              with open(path, 'r') as f: c = f.read()
+              
+              # 【最重要修正】一括置換はやめる。
+              # applicationId = "..." の行だけをピンポイントで書き換える。
+              # namespace = "..." は元のまま残すことで Rクラスのエラーを防ぐ。
+              c = re.sub(r'applicationId\s*=\s*"[^"]*"', f'applicationId = "{APP_ID}"', c)
+
+              # プラグイン無効化
+              c = c.replace('alias(libs.plugins.google.services)', '// alias')
+              c = c.replace('id("com.google.gms.google-services")', '// id')
+
+              # アプリ名注入 (文法修正済み)
+              if 'defaultConfig {' in c:
+                   c = c.replace('defaultConfig {', f'defaultConfig {{ \n resValue("string", "app_name", "{APP_NAME}")')
+
+              with open(path, 'w') as f: f.write(c)
+              print("Gradle Fixed.")
+
+          # AndroidManifest.xml
+          path = 'app/src/main/AndroidManifest.xml'
+          if os.path.exists(path):
+              with open(path, 'r') as f: c = f.read()
+              
+              # 参照先変更
+              c = re.sub(r'android:label="[^"]*"', 'android:label="@string/app_name"', c)
+              c = re.sub(r'android:icon="[^"]*"', 'android:icon="@mipmap/ic_launcher"', c)
+              
+              # 丸アイコン設定
+              if 'android:roundIcon=' in c:
+                  c = re.sub(r'android:roundIcon="[^"]*"', 'android:roundIcon="@mipmap/ic_launcher_round"', c)
+              else:
+                  c = c.replace('<application', '<application android:roundIcon="@mipmap/ic_launcher_round"')
                   
-                  # 1. applicationId の書き換え
-                  c = re.sub(r'applicationId\s*=\s*"[^"]*"', f'applicationId = "{APP_ID}"', c)
-                  
-                  # 2. Google Services Plugin 無効化
-                  c = c.replace('alias(libs.plugins.google.services)', '// alias(libs.plugins.google.services)')
-                  c = c.replace('id("com.google.gms.google-services")', '// id("com.google.gms.google-services")')
-
-                  # 3. アプリ名と背景色の強制注入 (Kotlin DSL形式)
-                  if 'defaultConfig {' in c:
-                      # resValue("type", "name", "value")
-                      inj = f'defaultConfig {{ \n resValue("string", "app_name", "{APP_NAME}") \n resValue("color", "ic_launcher_background_force", "#000000")'
-                      c = c.replace('defaultConfig {', inj)
-
-                  with open(g_path, "w") as f: f.write(c)
-                  print("Gradle updated.")
-
-              # Manifest修正
-              m_path = "app/src/main/AndroidManifest.xml"
-              if os.path.exists(m_path):
-                  with open(m_path, "r") as f: c = f.read()
-                  
-                  # 名前とアイコンの参照先をリソースに向ける
-                  # ここで @string/app_name にしておけば、上で注入した resValue が使われる
-                  c = re.sub(r'android:label="[^"]*"', 'android:label="@string/app_name"', c)
-                  c = re.sub(r'android:icon="[^"]*"', 'android:icon="@mipmap/ic_launcher"', c)
-                  
-                  # 丸アイコンの設定
-                  if 'android:roundIcon=' in c:
-                      c = re.sub(r'android:roundIcon="[^"]*"', 'android:roundIcon="@mipmap/ic_launcher_round"', c)
-                  else:
-                      c = c.replace('<application', '<application android:roundIcon="@mipmap/ic_launcher_round"')
-                      
-                  with open(m_path, "w") as f: f.write(c)
-                  print("Manifest updated.")
-
-          if __name__ == "__main__":
-              process_icon()
-              process_code()
+              with open(path, 'w') as f: f.write(c)
+              print("Manifest Fixed.")
           EOF
           
           python modify.py
@@ -187,7 +180,7 @@ jobs:
         if: steps.check.outputs.trigger == 'true'
         run: chmod +x gradlew
 
-      # 5. ビルド (クリーンビルド・デーモン無効)
+      # 4. ビルド
       - name: Build APK
         if: steps.check.outputs.trigger == 'true'
         run: ./gradlew clean assembleRelease --no-configuration-cache -x lint -x test -Dorg.gradle.daemon=false
@@ -196,14 +189,13 @@ jobs:
           LASTFM_API_KEY: "dummy"
           LASTFM_SECRET: "dummy"
 
-      # 6. 回収
-      - name: Collect APKs
+      # 5. 回収 & 署名 & リリース
+      - name: Collect and Release
         if: steps.check.outputs.trigger == 'true'
         run: |
           mkdir -p output_apks
           find app/build/outputs/apk -name "*.apk" -type f -exec cp {} output_apks/ \;
 
-      # 7. 署名
       - name: Sign APK
         if: steps.check.outputs.trigger == 'true'
         uses: ilharp/sign-android-release@v1
@@ -215,7 +207,6 @@ jobs:
           keyPassword: ${{ secrets.KEY_PASSWORD }}
           buildToolsVersion: "34.0.0"
 
-      # 8. リリース
       - name: Create Release
         if: steps.check.outputs.trigger == 'true'
         uses: softprops/action-gh-release@v2
