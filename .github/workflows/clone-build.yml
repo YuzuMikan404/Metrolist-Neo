@@ -73,7 +73,7 @@ jobs:
         run: |
           pip install Pillow
 
-          # 外部ファイルとして書き出すことでYAMLのエラーを回避
+          # Pythonスクリプト作成
           cat << 'EOF' > modify.py
           import os
           import shutil
@@ -97,6 +97,7 @@ jobs:
                   bg_hex = '#{:02x}{:02x}{:02x}'.format(*p[:3]) if p[3] > 0 else '#000000'
                   print(f'Detected Background: {bg_hex}')
 
+                  # 前景画像 (70%)
                   size = 1080
                   target = int(size * 0.70)
                   canvas = Image.new('RGBA', (size, size), (0, 0, 0, 0))
@@ -106,18 +107,19 @@ jobs:
                   canvas.save('ic_foreground_gen.png')
                   img.save('ic_legacy_gen.png')
 
-                  # 既存削除 (ファイル名で指定)
+                  # ic_launcher ファイルのみ削除
                   for root, dirs, files in os.walk(RES_DIR):
                       for f in files:
                           if 'ic_launcher' in f:
                               os.remove(os.path.join(root, f))
 
-                  # 配置
+                  # フォルダ準備
                   anydpi = os.path.join(RES_DIR, 'mipmap-anydpi-v26')
                   legacy = os.path.join(RES_DIR, 'mipmap-xxxhdpi')
                   values = os.path.join(RES_DIR, 'values')
                   for d in [anydpi, legacy, values]: os.makedirs(d, exist_ok=True)
 
+                  # XML定義
                   xml = f'''<?xml version="1.0" encoding="utf-8"?>
           <adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">
               <background android:drawable="@color/ic_launcher_background" />
@@ -126,13 +128,16 @@ jobs:
                   with open(os.path.join(anydpi, 'ic_launcher.xml'), 'w') as f: f.write(xml)
                   with open(os.path.join(anydpi, 'ic_launcher_round.xml'), 'w') as f: f.write(xml)
 
+                  # 色定義
                   c_xml = f'''<?xml version="1.0" encoding="utf-8"?>
           <resources><color name="ic_launcher_background">{bg_hex}</color></resources>'''
                   with open(os.path.join(values, 'ic_launcher_background.xml'), 'w') as f: f.write(c_xml)
 
+                  # 画像配置
                   shutil.copy('ic_foreground_gen.png', os.path.join(legacy, 'ic_launcher_foreground.png'))
                   shutil.copy('ic_legacy_gen.png', os.path.join(legacy, 'ic_launcher.png'))
                   shutil.copy('ic_legacy_gen.png', os.path.join(legacy, 'ic_launcher_round.png'))
+                  
               except Exception as e:
                   print(f'Icon Error: {e}')
 
@@ -146,8 +151,11 @@ jobs:
                   c = c.replace('com.metrolist.music', APP_ID)
                   c = re.sub(r'(.*alias\(libs\.plugins\.google\.services\).*)', r'// \1', c)
                   c = re.sub(r'(.*id\("com\.google\.gms\.google-services"\).*)', r'// \1', c)
+                  
+                  # 修正点: Kotlin DSL形式 (カッコ付き) で注入
                   if 'defaultConfig {' in c:
-                      c = c.replace('defaultConfig {', f'defaultConfig {{ \n resValue "string", "app_name", "{APP_NAME}"')
+                      c = c.replace('defaultConfig {', f'defaultConfig {{ \n resValue("string", "app_name", "{APP_NAME}")')
+                      
                   with open(g_path, 'w') as f: f.write(c)
 
               m_path = 'app/src/main/AndroidManifest.xml'
@@ -200,7 +208,7 @@ jobs:
           keyPassword: ${{ secrets.KEY_PASSWORD }}
           buildToolsVersion: "34.0.0"
 
-      # 8. リリース (ここを修正しました)
+      # 8. リリース
       - name: Create Release
         if: steps.setup.outputs.trigger == 'true'
         uses: softprops/action-gh-release@v2
