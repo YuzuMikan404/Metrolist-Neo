@@ -5,7 +5,7 @@
 
 <div style="padding: 16px; margin: 16px 0; background-color: #FFFBE5; border-left: 6px solid #FFC107; border-radius: 4px;">
 <h2 style="margin: 0;"><strong>⚠Warning</strong></h2>
-If you're in a region where YouTube Music is not supported, you won't be able to use this app <strong>unless</strong> you have a proxy or VPN to connect to a YTM-supported region.
+コードは本家から持ってきているので更新しません。あくまで自分用なので使う方は自己責任で使ってください。
 </div>
 
 <h1>Screenshots</h1>
