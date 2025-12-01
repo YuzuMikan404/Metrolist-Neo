@@ -52,7 +52,7 @@ jobs:
             git push --delete origin "$UPSTREAM_TAG" || true
             echo "trigger=true" >> $GITHUB_OUTPUT
             echo "tag=$UPSTREAM_TAG" >> $GITHUB_OUTPUT
-          elif ! git rev-parse "$UPSTREAM_TAG" >/dev/null 2>&1; then
+          elif [ -z "$(git ls-remote --tags origin "refs/tags/$UPSTREAM_TAG")" ]; then  # Fix: Use ls-remote to check remote tag existence
             echo "trigger=true" >> $GITHUB_OUTPUT
             echo "tag=$UPSTREAM_TAG" >> $GITHUB_OUTPUT
           else
@@ -67,8 +67,8 @@ jobs:
           if [ -f icon.png ]; then cp icon.png /tmp/icon.png; fi
           
           git remote add upstream https://github.com/mostafaalagamy/Metrolist.git
-          git fetch upstream --tags
-          git checkout -b build-${{ steps.check.outputs.tag }} refs/tags/${{ steps.check.outputs.tag }}
+          git fetch upstream --tags --force  # Fix: Add --force to handle any tag conflicts
+          git checkout -b build-\( {{ steps.check.outputs.tag }} refs/tags/ \){{ steps.check.outputs.tag }}
           
           if [ -f /tmp/icon.png ]; then mv /tmp/icon.png icon.png; fi
 
