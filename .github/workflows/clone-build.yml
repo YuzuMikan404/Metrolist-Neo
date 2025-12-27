@@ -11,7 +11,7 @@ permissions:
 jobs:
   build:
     runs-on: ubuntu-latest
-    timeout-minutes: 45 # 念のため時間を延長
+    timeout-minutes: 45
 
     steps:
       # ---------------------------------------------------------
@@ -52,7 +52,7 @@ jobs:
             git push --delete origin "$UPSTREAM_TAG" || true
             echo "trigger=true" >> $GITHUB_OUTPUT
             echo "tag=$UPSTREAM_TAG" >> $GITHUB_OUTPUT
-          elif [ -z "$(git ls-remote --tags origin "refs/tags/$UPSTREAM_TAG")" ]; then  # リモートタグ存在チェック
+          elif [ -z "$(git ls-remote --tags origin "refs/tags/$UPSTREAM_TAG")" ]; then
             echo "trigger=true" >> $GITHUB_OUTPUT
             echo "tag=$UPSTREAM_TAG" >> $GITHUB_OUTPUT
           else
@@ -67,9 +67,8 @@ jobs:
           if [ -f icon.png ]; then cp icon.png /tmp/icon.png; fi
           
           git remote add upstream https://github.com/mostafaalagamy/Metrolist.git
-          git fetch upstream --tags --force  # タグ競合を強制解決
+          git fetch upstream --tags --force
           
-          # Fix: チェックアウトを2ステップに分ける（競合回避）
           TAG="${{ steps.check.outputs.tag }}"
           git checkout "$TAG"
           git checkout -b "build-$TAG"
@@ -155,8 +154,7 @@ jobs:
               with open('app/google-services.json', 'w') as f:
                   f.write('{"project_info":{"project_number":"0","project_id":"d"},"client":[{"client_info":{"mobilesdk_app_id":"1:0:a:0","android_client_info":{"package_name":"' + APP_ID + '"}},"api_key":[{"current_key":"d"}]}]}')
 
-              # gradle.properties を生成してメモリ設定とR8設定を注入
-              # これがクラッシュ回避のキモ
+              # gradle.properties を生成
               properties_content = """
           org.gradle.jvmargs=-Xmx3072m -XX:MaxMetaspaceSize=1g -Xss4m -XX:+HeapDumpOnOutOfMemoryError -Dfile.encoding=UTF-8
           android.useAndroidX=true
@@ -208,7 +206,6 @@ jobs:
         run: chmod +x gradlew
 
       # 5. ビルド
-      # メモリ設定は gradle.properties で行うため、ここでは引数をシンプルにする
       - name: Build APK
         if: steps.check.outputs.trigger == 'true'
         run: ./gradlew clean assembleRelease --no-configuration-cache --stacktrace --no-daemon
@@ -217,14 +214,19 @@ jobs:
           LASTFM_API_KEY: "dummy"
           LASTFM_SECRET: "dummy"
 
-      # 6. 回収
+      # 6. 回収 (名前変更 & unsigned 削除)
       - name: Collect APKs
         if: steps.check.outputs.trigger == 'true'
         run: |
           mkdir -p output_apks
-          find app/build/outputs/apk -name "*.apk" -type f -exec cp {} output_apks/ \;
+          # "app" -> "Metrolist-Neo" に変更し、"-unsigned" を削除
+          find app/build/outputs/apk -name "*.apk" -type f | while read f; do
+            filename=$(basename "$f")
+            newname=$(echo "$filename" | sed -e 's/^app/Metrolist-Neo/' -e 's/-unsigned//')
+            cp "$f" "output_apks/$newname"
+          done
 
-      # 7. 署名
+      # 7. 署名 (自動で -signed が付く)
       - name: Sign APK
         if: steps.check.outputs.trigger == 'true'
         uses: ilharp/sign-android-release@v1
@@ -237,7 +239,16 @@ jobs:
           keyPassword: ${{ secrets.KEY_PASSWORD }}
           buildToolsVersion: "34.0.0"
 
-      # 8. リリース
+      # 8. リネーム (-signed を削除)
+      - name: Rename Signed APKs
+        if: steps.check.outputs.trigger == 'true'
+        run: |
+          cd output_apks
+          for f in *-signed.apk; do
+            mv "$f" "${f/-signed/}"
+          done
+
+      # 9. リリース
       - name: Create Release
         if: steps.check.outputs.trigger == 'true'
         uses: softprops/action-gh-release@v2
@@ -246,7 +257,7 @@ jobs:
           name: ${{ steps.check.outputs.tag }}
           body: |
              Original: https://github.com/mostafaalagamy/Metrolist/releases/tag/${{ steps.check.outputs.tag }}
-          files: output_apks/*-signed.apk
+          files: output_apks/*.apk
           draft: false
           prerelease: false
         env:
