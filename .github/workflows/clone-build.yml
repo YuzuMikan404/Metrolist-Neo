@@ -23,7 +23,7 @@ jobs:
           fetch-depth: 0
 
       # ---------------------------------------------------------
-      # 2. 環境構築 (Java 21)
+      # 2. 環境構築
       # ---------------------------------------------------------
       - uses: actions/setup-java@v4
         with:
@@ -76,7 +76,7 @@ jobs:
           if [ -f /tmp/icon.png ]; then mv /tmp/icon.png icon.png; fi
 
       # ---------------------------------------------------------
-      # 4. 改造スクリプト (メモリ設定・R8設定を注入)
+      # 4. 改造スクリプト
       # ---------------------------------------------------------
       - name: Apply Modifications
         if: steps.check.outputs.trigger == 'true'
@@ -95,16 +95,11 @@ jobs:
           ICON_SRC = 'icon.png'
           RES_DIR = 'app/src/main/res'
 
-          # === A. アイコン画像の生成 ===
           def process_icon():
               if not os.path.exists(ICON_SRC):
-                  print('Warning: No icon.png found.')
-                  return ('#000000')
-
+                  return '#000000'
               try:
-                  print(f'Processing {ICON_SRC}...')
                   img = Image.open(ICON_SRC).convert('RGBA')
-                  
                   p = img.resize((1, 1)).getpixel((0, 0))
                   bg_hex = '#{:02x}{:02x}{:02x}'.format(*p[:3]) if p[3] > 0 else '#000000'
 
@@ -119,8 +114,7 @@ jobs:
 
                   for root, dirs, files in os.walk(RES_DIR):
                       for f in files:
-                          if 'ic_launcher' in f:
-                              os.remove(os.path.join(root, f))
+                          if 'ic_launcher' in f: os.remove(os.path.join(root, f))
 
                   anydpi = os.path.join(RES_DIR, 'mipmap-anydpi-v26')
                   legacy = os.path.join(RES_DIR, 'mipmap-xxxhdpi')
@@ -142,46 +136,32 @@ jobs:
                   shutil.copy('ic_foreground_gen.png', os.path.join(legacy, 'ic_launcher_foreground.png'))
                   shutil.copy('ic_legacy_gen.png', os.path.join(legacy, 'ic_launcher.png'))
                   shutil.copy('ic_legacy_gen.png', os.path.join(legacy, 'ic_launcher_round.png'))
-                  
                   return bg_hex
-              except Exception as e:
-                  print(f'Icon Error: {e}')
-                  return '#000000'
+              except: return '#000000'
 
-          # === B. ソースコードの書き換え ===
           def process_code(bg_hex):
-              # ダミーJSON
               with open('app/google-services.json', 'w') as f:
                   f.write('{"project_info":{"project_number":"0","project_id":"d"},"client":[{"client_info":{"mobilesdk_app_id":"1:0:a:0","android_client_info":{"package_name":"' + APP_ID + '"}},"api_key":[{"current_key":"d"}]}]}')
 
-              # gradle.properties を生成
               properties_content = """
           org.gradle.jvmargs=-Xmx3072m -XX:MaxMetaspaceSize=1g -Xss4m -XX:+HeapDumpOnOutOfMemoryError -Dfile.encoding=UTF-8
           android.useAndroidX=true
           android.enableJetifier=true
           android.enableR8.fullMode=false
           """
-              with open('gradle.properties', 'w') as f:
-                  f.write(properties_content)
-              print("gradle.properties Created with Memory Settings.")
+              with open('gradle.properties', 'w') as f: f.write(properties_content)
 
-              # build.gradle.kts
               g_path = 'app/build.gradle.kts'
               if os.path.exists(g_path):
                   with open(g_path, 'r') as f: c = f.read()
-                  
                   c = re.sub(r'applicationId\s*=\s*"[^"]*"', f'applicationId = "{APP_ID}"', c)
                   c = re.sub(r'(.*alias\(libs\.plugins\.google\.services\).*)', r'// \1', c)
                   c = re.sub(r'(.*id\(\"com\.google\.gms\.google-services\"\).*)', r'// \1', c)
-
                   if 'defaultConfig {' in c:
                       inj = f'defaultConfig {{ \n resValue("string", "app_name", "{APP_NAME}") \n resValue("color", "ic_launcher_background_gradle", "{bg_hex}")'
                       c = c.replace('defaultConfig {', inj)
-                  
                   with open(g_path, 'w') as f: f.write(c)
-                  print("Gradle Updated.")
 
-              # Manifest修正
               m_path = 'app/src/main/AndroidManifest.xml'
               if os.path.exists(m_path):
                   with open(m_path, 'r') as f: c = f.read()
@@ -192,13 +172,11 @@ jobs:
                   else:
                       c = c.replace('<application', '<application android:roundIcon="@mipmap/ic_launcher_round"')
                   with open(m_path, 'w') as f: f.write(c)
-                  print("Manifest Updated.")
 
           if __name__ == "__main__":
               bg = process_icon()
               process_code(bg)
           EOF
-          
           python modify.py
 
       - name: Grant Permissions
@@ -219,7 +197,6 @@ jobs:
         if: steps.check.outputs.trigger == 'true'
         run: |
           mkdir -p output_apks
-          # "app" -> "Metrolist-Neo" に変更し、"-unsigned" を削除
           find app/build/outputs/apk -name "*.apk" -type f | while read f; do
             filename=$(basename "$f")
             newname=$(echo "$filename" | sed -e 's/^app/Metrolist-Neo/' -e 's/-unsigned//')
@@ -239,14 +216,20 @@ jobs:
           keyPassword: ${{ secrets.KEY_PASSWORD }}
           buildToolsVersion: "34.0.0"
 
-      # 8. リネーム (-signed を削除)
+      # 8. リネーム & クリーンアップ
+      # -signed を削除し、余計な -temp ファイルも削除する
       - name: Rename Signed APKs
         if: steps.check.outputs.trigger == 'true'
         run: |
           cd output_apks
+          
+          # 署名済みファイルの名前を整える
           for f in *-signed.apk; do
             mv "$f" "${f/-signed/}"
           done
+          
+          # 余計なゴミファイル (-temp) を削除
+          rm -f *-temp.apk
 
       # 9. リリース
       - name: Create Release
