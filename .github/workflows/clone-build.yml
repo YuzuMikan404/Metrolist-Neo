@@ -3,7 +3,7 @@ name: Build Metrolist Neo
 on:
   workflow_dispatch:
   schedule:
-    - cron: '0 23 * * *'
+    - cron: '0 * * * *'
 
 permissions:
   contents: write
@@ -150,10 +150,11 @@ jobs:
               with open('app/google-services.json', 'w') as f:
                   f.write('{"project_info":{"project_number":"0","project_id":"d"},"client":[{"client_info":{"mobilesdk_app_id":"1:0:a:0","android_client_info":{"package_name":"' + APP_ID + '"}},"api_key":[{"current_key":"d"}]}]}')
 
-              # 修正: kotlin.daemon.jvmargs を追加してメモリ不足(OOM)を回避
+              # 修正: メモリ不足(OOM)回避のため 3GB->5GB に増量し、並列ビルドを無効化
               properties_content = """
-          org.gradle.jvmargs=-Xmx3072m -XX:MaxMetaspaceSize=1g -Xss4m -XX:+HeapDumpOnOutOfMemoryError -Dfile.encoding=UTF-8
-          kotlin.daemon.jvmargs=-Xmx3072m -XX:MaxMetaspaceSize=1g -Xss4m
+          org.gradle.jvmargs=-Xmx5120m -XX:MaxMetaspaceSize=1g -XX:+HeapDumpOnOutOfMemoryError -Dfile.encoding=UTF-8
+          kotlin.daemon.jvmargs=-Xmx5120m -XX:MaxMetaspaceSize=1g
+          org.gradle.parallel=false
           android.useAndroidX=true
           android.enableJetifier=true
           android.enableR8.fullMode=false
