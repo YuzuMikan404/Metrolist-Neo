@@ -138,7 +138,7 @@ jobs:
                   with open(os.path.join(values, 'ic_launcher_background.xml'), 'w') as f: f.write(c_xml)
 
                   shutil.copy('ic_foreground_gen.png', os.path.join(legacy, 'ic_launcher_foreground.png'))
-                  # 修正: drawableにもフォアグラウンド画像をコピー (エラー対処)
+                  # 修正: drawableにもフォアグラウンド画像をコピー (ビルドエラー対処)
                   shutil.copy('ic_foreground_gen.png', os.path.join(drawable, 'ic_launcher_foreground.png'))
                   
                   shutil.copy('ic_legacy_gen.png', os.path.join(legacy, 'ic_launcher.png'))
@@ -150,8 +150,10 @@ jobs:
               with open('app/google-services.json', 'w') as f:
                   f.write('{"project_info":{"project_number":"0","project_id":"d"},"client":[{"client_info":{"mobilesdk_app_id":"1:0:a:0","android_client_info":{"package_name":"' + APP_ID + '"}},"api_key":[{"current_key":"d"}]}]}')
 
+              # 修正: kotlin.daemon.jvmargs を追加してメモリ不足(OOM)を回避
               properties_content = """
           org.gradle.jvmargs=-Xmx3072m -XX:MaxMetaspaceSize=1g -Xss4m -XX:+HeapDumpOnOutOfMemoryError -Dfile.encoding=UTF-8
+          kotlin.daemon.jvmargs=-Xmx3072m -XX:MaxMetaspaceSize=1g -Xss4m
           android.useAndroidX=true
           android.enableJetifier=true
           android.enableR8.fullMode=false
