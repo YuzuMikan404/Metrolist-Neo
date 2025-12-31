@@ -11,7 +11,8 @@ permissions:
 jobs:
   build:
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    # 並列化しても大規模ビルドは時間がかかる場合があるため、余裕を持って90分に設定
+    timeout-minutes: 90
 
     steps:
       # ---------------------------------------------------------
@@ -150,11 +151,12 @@ jobs:
               with open('app/google-services.json', 'w') as f:
                   f.write('{"project_info":{"project_number":"0","project_id":"d"},"client":[{"client_info":{"mobilesdk_app_id":"1:0:a:0","android_client_info":{"package_name":"' + APP_ID + '"}},"api_key":[{"current_key":"d"}]}]}')
 
-              # 修正: メモリ不足(OOM)回避のため 3GB->5GB に増量し、並列ビルドを無効化
+              # 修正: 並列ビルドを有効化 (parallel=true)
+              # メモリ設定: 5GBだと並列時に落ちる可能性があるため、4GB(4096m)に調整
               properties_content = """
-          org.gradle.jvmargs=-Xmx5120m -XX:MaxMetaspaceSize=1g -XX:+HeapDumpOnOutOfMemoryError -Dfile.encoding=UTF-8
-          kotlin.daemon.jvmargs=-Xmx5120m -XX:MaxMetaspaceSize=1g
-          org.gradle.parallel=false
+          org.gradle.jvmargs=-Xmx4096m -XX:MaxMetaspaceSize=1g -XX:+HeapDumpOnOutOfMemoryError -Dfile.encoding=UTF-8
+          kotlin.daemon.jvmargs=-Xmx4096m -XX:MaxMetaspaceSize=1g
+          org.gradle.parallel=true
           android.useAndroidX=true
           android.enableJetifier=true
           android.enableR8.fullMode=false
