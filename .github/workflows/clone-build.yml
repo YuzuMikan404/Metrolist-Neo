@@ -11,7 +11,6 @@ permissions:
 jobs:
   build:
     runs-on: ubuntu-latest
-    # 並列化しても大規模ビルドは時間がかかる場合があるため、余裕を持って90分に設定
     timeout-minutes: 90
 
     steps:
@@ -26,19 +25,25 @@ jobs:
       # ---------------------------------------------------------
       # 2. 環境構築
       # ---------------------------------------------------------
-      - uses: actions/setup-java@v4
+      - name: Setup Java
+        uses: actions/setup-java@v4
         with:
           java-version: '21'
           distribution: 'temurin'
       
-      - uses: actions/setup-python@v5
+      - name: Setup Python
+        uses: actions/setup-python@v5
         with:
           python-version: '3.x'
       
-      - uses: gradle/actions/setup-gradle@v4
+      # Gradleのセットアップ（キャッシュ有効化）
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          cache-read-only: false
 
       # ---------------------------------------------------------
-      # 3. チェック & ソース取得
+      # 3. 更新チェック & ソース取得
       # ---------------------------------------------------------
       - name: Check Updates
         id: check
@@ -46,40 +51,48 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           UPSTREAM_TAG=$(gh api repos/mostafaalagamy/Metrolist/releases/latest --jq .tag_name)
-          echo "Target: $UPSTREAM_TAG"
+          echo "Target Version: $UPSTREAM_TAG"
 
           if [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
+            echo "Manual trigger detected. Force rebuilding $UPSTREAM_TAG..."
             gh release delete "$UPSTREAM_TAG" --yes --cleanup-tag || true
             git push --delete origin "$UPSTREAM_TAG" || true
             echo "trigger=true" >> $GITHUB_OUTPUT
             echo "tag=$UPSTREAM_TAG" >> $GITHUB_OUTPUT
           elif [ -z "$(git ls-remote --tags origin "refs/tags/$UPSTREAM_TAG")" ]; then
+            echo "New version detected: $UPSTREAM_TAG"
             echo "trigger=true" >> $GITHUB_OUTPUT
             echo "tag=$UPSTREAM_TAG" >> $GITHUB_OUTPUT
           else
+            echo "Version $UPSTREAM_TAG already exists. Skipping."
             echo "trigger=false" >> $GITHUB_OUTPUT
           fi
 
-      - name: Fetch Source
+      - name: Fetch and Switch Source
         if: steps.check.outputs.trigger == 'true'
         run: |
           git config user.name "Action"
           git config user.email "action@github.com"
+          
+          # アイコンのバックアップ
           if [ -f icon.png ]; then cp icon.png /tmp/icon.png; fi
           
+          # 上流リポジトリの取得
           git remote add upstream https://github.com/mostafaalagamy/Metrolist.git
           git fetch upstream --tags --force
           
           TAG="${{ steps.check.outputs.tag }}"
+          echo "Checking out tag: $TAG"
           git checkout "$TAG"
           git checkout -b "build-$TAG"
           
+          # アイコンの復元
           if [ -f /tmp/icon.png ]; then mv /tmp/icon.png icon.png; fi
 
       # ---------------------------------------------------------
-      # 4. 改造スクリプト
+      # 4. 堅牢な改造スクリプトの適用
       # ---------------------------------------------------------
-      - name: Apply Modifications
+      - name: Apply Robust Modifications
         if: steps.check.outputs.trigger == 'true'
         run: |
           pip install Pillow
@@ -88,134 +101,242 @@ jobs:
           import os
           import shutil
           import re
+          import sys
           from PIL import Image, ImageOps
 
-          # 設定
+          # ==========================================
+          # 設定定数
+          # ==========================================
           APP_NAME = 'Metrolist Neo'
           APP_ID = 'com.metrolist.clone'
           ICON_SRC = 'icon.png'
-          RES_DIR = 'app/src/main/res'
+          BASE_DIR = 'app'
+          RES_DIR = os.path.join(BASE_DIR, 'src/main/res')
+          GRADLE_FILE = os.path.join(BASE_DIR, 'build.gradle.kts')
+          MANIFEST_FILE = os.path.join(BASE_DIR, 'src/main/AndroidManifest.xml')
+          PROGUARD_FILE = os.path.join(BASE_DIR, 'proguard-rules.pro')
+
+          def log(msg):
+              print(f"[MODIFY] {msg}")
+
+          def error_exit(msg):
+              print(f"[ERROR] {msg}")
+              sys.exit(1)
 
           def process_icon():
+              log("Processing Icon...")
               if not os.path.exists(ICON_SRC):
+                  log("No custom icon.png found. Using default background color.")
                   return '#000000'
+              
               try:
                   img = Image.open(ICON_SRC).convert('RGBA')
+                  # 左上のピクセルから背景色を抽出
                   p = img.resize((1, 1)).getpixel((0, 0))
                   bg_hex = '#{:02x}{:02x}{:02x}'.format(*p[:3]) if p[3] > 0 else '#000000'
 
+                  # アダプティブアイコンの生成
                   size = 1080
                   target = int(size * 0.65)
                   canvas = Image.new('RGBA', (size, size), (0, 0, 0, 0))
                   resized = ImageOps.fit(img, (target, target), centering=(0.5, 0.5))
                   offset = (size - target) // 2
                   canvas.paste(resized, (offset, offset), resized)
+                  
                   canvas.save('ic_foreground_gen.png')
                   img.save('ic_legacy_gen.png')
 
+                  # 既存のアイコン削除
                   for root, dirs, files in os.walk(RES_DIR):
                       for f in files:
-                          if 'ic_launcher' in f: os.remove(os.path.join(root, f))
+                          if 'ic_launcher' in f:
+                              os.remove(os.path.join(root, f))
 
-                  anydpi = os.path.join(RES_DIR, 'mipmap-anydpi-v26')
-                  legacy = os.path.join(RES_DIR, 'mipmap-xxxhdpi')
-                  values = os.path.join(RES_DIR, 'values')
-                  # 修正: drawableディレクトリを追加
-                  drawable = os.path.join(RES_DIR, 'drawable')
+                  # 必要なディレクトリ確保
+                  dirs_to_make = [
+                      os.path.join(RES_DIR, 'mipmap-anydpi-v26'),
+                      os.path.join(RES_DIR, 'mipmap-xxxhdpi'),
+                      os.path.join(RES_DIR, 'values'),
+                      os.path.join(RES_DIR, 'drawable')
+                  ]
+                  for d in dirs_to_make:
+                      os.makedirs(d, exist_ok=True)
 
-                  # 修正: drawableも含めてフォルダ作成
-                  for d in [anydpi, legacy, values, drawable]: os.makedirs(d, exist_ok=True)
-
-                  xml = f'''<?xml version="1.0" encoding="utf-8"?>
+                  # XML生成
+                  adaptive_xml = '''<?xml version="1.0" encoding="utf-8"?>
           <adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">
               <background android:drawable="@color/ic_launcher_background" />
               <foreground android:drawable="@mipmap/ic_launcher_foreground" />
           </adaptive-icon>'''
-                  with open(os.path.join(anydpi, 'ic_launcher.xml'), 'w') as f: f.write(xml)
-                  with open(os.path.join(anydpi, 'ic_launcher_round.xml'), 'w') as f: f.write(xml)
-
-                  c_xml = f'''<?xml version="1.0" encoding="utf-8"?>
-          <resources><color name="ic_launcher_background">{bg_hex}</color></resources>'''
-                  with open(os.path.join(values, 'ic_launcher_background.xml'), 'w') as f: f.write(c_xml)
-
-                  shutil.copy('ic_foreground_gen.png', os.path.join(legacy, 'ic_launcher_foreground.png'))
-                  # 修正: drawableにもフォアグラウンド画像をコピー (ビルドエラー対処)
-                  shutil.copy('ic_foreground_gen.png', os.path.join(drawable, 'ic_launcher_foreground.png'))
                   
-                  shutil.copy('ic_legacy_gen.png', os.path.join(legacy, 'ic_launcher.png'))
-                  shutil.copy('ic_legacy_gen.png', os.path.join(legacy, 'ic_launcher_round.png'))
+                  anydpi_path = os.path.join(RES_DIR, 'mipmap-anydpi-v26')
+                  with open(os.path.join(anydpi_path, 'ic_launcher.xml'), 'w') as f: f.write(adaptive_xml)
+                  with open(os.path.join(anydpi_path, 'ic_launcher_round.xml'), 'w') as f: f.write(adaptive_xml)
+
+                  color_xml = f'''<?xml version="1.0" encoding="utf-8"?>
+          <resources><color name="ic_launcher_background">{bg_hex}</color></resources>'''
+                  with open(os.path.join(RES_DIR, 'values/ic_launcher_background.xml'), 'w') as f: f.write(color_xml)
+
+                  # 画像配置
+                  legacy_path = os.path.join(RES_DIR, 'mipmap-xxxhdpi')
+                  drawable_path = os.path.join(RES_DIR, 'drawable')
+                  
+                  shutil.copy('ic_foreground_gen.png', os.path.join(legacy_path, 'ic_launcher_foreground.png'))
+                  shutil.copy('ic_foreground_gen.png', os.path.join(drawable_path, 'ic_launcher_foreground.png'))
+                  shutil.copy('ic_legacy_gen.png', os.path.join(legacy_path, 'ic_launcher.png'))
+                  shutil.copy('ic_legacy_gen.png', os.path.join(legacy_path, 'ic_launcher_round.png'))
+                  
+                  log(f"Icon processing complete. Background: {bg_hex}")
                   return bg_hex
-              except: return '#000000'
+              except Exception as e:
+                  log(f"Icon processing failed: {e}")
+                  return '#000000'
 
-          def process_code(bg_hex):
-              with open('app/google-services.json', 'w') as f:
-                  f.write('{"project_info":{"project_number":"0","project_id":"d"},"client":[{"client_info":{"mobilesdk_app_id":"1:0:a:0","android_client_info":{"package_name":"' + APP_ID + '"}},"api_key":[{"current_key":"d"}]}]}')
+          def generate_dummy_google_services():
+              log("Generating dummy google-services.json...")
+              gs_path = os.path.join(BASE_DIR, 'google-services.json')
+              content = '{"project_info":{"project_number":"0","project_id":"d"},"client":[{"client_info":{"mobilesdk_app_id":"1:0:a:0","android_client_info":{"package_name":"' + APP_ID + '"}},"api_key":[{"current_key":"d"}]}]}'
+              with open(gs_path, 'w') as f:
+                  f.write(content)
 
-              # 修正: 並列ビルドを有効化 (parallel=true)
-              # メモリ設定: 5GBだと並列時に落ちる可能性があるため、4GB(4096m)に調整
-              properties_content = """
+          def update_gradle_properties():
+              log("Overwriting gradle.properties for robust CI build...")
+              # メモリ設定を4GBにし、並列ビルドを有効化
+              props = """
           org.gradle.jvmargs=-Xmx4096m -XX:MaxMetaspaceSize=1g -XX:+HeapDumpOnOutOfMemoryError -Dfile.encoding=UTF-8
           kotlin.daemon.jvmargs=-Xmx4096m -XX:MaxMetaspaceSize=1g
           org.gradle.parallel=true
+          org.gradle.caching=true
           android.useAndroidX=true
           android.enableJetifier=true
           android.enableR8.fullMode=false
           """
-              with open('gradle.properties', 'w') as f: f.write(properties_content)
+              with open('gradle.properties', 'w') as f:
+                  f.write(props)
 
-              g_path = 'app/build.gradle.kts'
-              if os.path.exists(g_path):
-                  with open(g_path, 'r') as f: c = f.read()
-                  c = re.sub(r'applicationId\s*=\s*"[^"]*"', f'applicationId = "{APP_ID}"', c)
-                  c = re.sub(r'(.*alias\(libs\.plugins\.google\.services\).*)', r'// \1', c)
-                  c = re.sub(r'(.*id\(\"com\.google\.gms\.google-services\"\).*)', r'// \1', c)
-                  if 'defaultConfig {' in c:
-                      inj = f'defaultConfig {{ \n resValue("string", "app_name", "{APP_NAME}") \n resValue("color", "ic_launcher_background_gradle", "{bg_hex}")'
-                      c = c.replace('defaultConfig {', inj)
-                  with open(g_path, 'w') as f: f.write(c)
+          def update_proguard_rules():
+              log("Updating ProGuard/R8 rules to prevent missing class errors...")
+              # 多くのライブラリで発生しがちな欠損クラス警告を無視する包括的なルール
+              robust_rules = """
+          # --- Added by Metrolist Neo Builder ---
+          # Jackson / Java Beans
+          -dontwarn java.beans.**
+          -dontwarn java.awt.**
+          -dontwarn java.nio.**
+          
+          # Common missing desktop modules
+          -dontwarn javax.security.**
+          -dontwarn javax.naming.**
+          -dontwarn javax.xml.**
+          -dontwarn sun.misc.**
+          
+          # Kotlin specifics
+          -dontwarn kotlin.reflect.**
+          # --------------------------------------
+          """
+              # ファイルが存在しない場合は新規作成、あれば追記
+              mode = 'a' if os.path.exists(PROGUARD_FILE) else 'w'
+              with open(PROGUARD_FILE, mode) as f:
+                  f.write(robust_rules)
 
-              m_path = 'app/src/main/AndroidManifest.xml'
-              if os.path.exists(m_path):
-                  with open(m_path, 'r') as f: c = f.read()
-                  c = re.sub(r'android:label="[^"]*"', 'android:label="@string/app_name"', c)
-                  c = re.sub(r'android:icon="[^"]*"', 'android:icon="@mipmap/ic_launcher"', c)
-                  if 'android:roundIcon=' in c:
-                      c = re.sub(r'android:roundIcon="[^"]*"', 'android:roundIcon="@mipmap/ic_launcher_round"', c)
-                  else:
-                      c = c.replace('<application', '<application android:roundIcon="@mipmap/ic_launcher_round"')
-                  with open(m_path, 'w') as f: f.write(c)
+          def update_build_gradle(bg_hex):
+              log(f"Patching {GRADLE_FILE}...")
+              if not os.path.exists(GRADLE_FILE):
+                  error_exit(f"Build file not found: {GRADLE_FILE}")
+
+              with open(GRADLE_FILE, 'r') as f:
+                  content = f.read()
+
+              # Application ID の変更 (スペースがあってもマッチする正規表現)
+              content = re.sub(r'applicationId\s*=\s*"[^"]*"', f'applicationId = "{APP_ID}"', content)
+
+              # Google Services プラグインの無効化
+              content = re.sub(r'(.*alias\(libs\.plugins\.google\.services\).*)', r'// \1', content)
+              content = re.sub(r'(.*id\(\"com\.google\.gms\.google-services\"\).*)', r'// \1', content)
+
+              # リソース値の注入 (defaultConfigブロック内)
+              if 'defaultConfig {' in content:
+                  injection = f'defaultConfig {{ \n        resValue("string", "app_name", "{APP_NAME}") \n        resValue("color", "ic_launcher_background_gradle", "{bg_hex}")'
+                  content = content.replace('defaultConfig {', injection)
+              else:
+                  log("WARNING: defaultConfig block not found in build.gradle.kts")
+
+              with open(GRADLE_FILE, 'w') as f:
+                  f.write(content)
+
+          def update_manifest():
+              log(f"Patching {MANIFEST_FILE}...")
+              if not os.path.exists(MANIFEST_FILE):
+                  error_exit(f"Manifest file not found: {MANIFEST_FILE}")
+
+              with open(MANIFEST_FILE, 'r') as f:
+                  content = f.read()
+
+              # ラベルとアイコンの変更
+              content = re.sub(r'android:label="[^"]*"', 'android:label="@string/app_name"', content)
+              content = re.sub(r'android:icon="[^"]*"', 'android:icon="@mipmap/ic_launcher"', content)
+              
+              # roundIconがある場合とない場合の両方に対応
+              if 'android:roundIcon=' in content:
+                  content = re.sub(r'android:roundIcon="[^"]*"', 'android:roundIcon="@mipmap/ic_launcher_round"', content)
+              else:
+                  # applicationタグに属性を追加
+                  content = content.replace('<application', '<application android:roundIcon="@mipmap/ic_launcher_round"')
+
+              with open(MANIFEST_FILE, 'w') as f:
+                  f.write(content)
 
           if __name__ == "__main__":
-              bg = process_icon()
-              process_code(bg)
+              try:
+                  bg_color = process_icon()
+                  generate_dummy_google_services()
+                  update_gradle_properties()
+                  update_proguard_rules()
+                  update_build_gradle(bg_color)
+                  update_manifest()
+                  log("All modifications applied successfully.")
+              except Exception as e:
+                  error_exit(f"Unexpected error: {e}")
           EOF
+          
           python modify.py
 
       - name: Grant Permissions
         if: steps.check.outputs.trigger == 'true'
         run: chmod +x gradlew
 
+      # ---------------------------------------------------------
       # 5. ビルド
+      # ---------------------------------------------------------
       - name: Build APK
         if: steps.check.outputs.trigger == 'true'
-        run: ./gradlew clean assembleRelease --no-configuration-cache --stacktrace --no-daemon
         env:
           GITHUB_EVENT_NAME: pull_request
           LASTFM_API_KEY: "dummy"
           LASTFM_SECRET: "dummy"
+        run: |
+          echo "Starting Build..."
+          ./gradlew clean assembleRelease \
+            --no-configuration-cache \
+            --stacktrace \
+            --no-daemon \
+            --warning-mode all
 
-      # 6. 回収 (名前変更 & unsigned 削除)
+      # ---------------------------------------------------------
+      # 6. アーティファクト回収と署名
+      # ---------------------------------------------------------
       - name: Collect APKs
         if: steps.check.outputs.trigger == 'true'
         run: |
           mkdir -p output_apks
           find app/build/outputs/apk -name "*.apk" -type f | while read f; do
             filename=$(basename "$f")
-            newname=$(echo "$filename" | sed -e 's/^app/Metrolist-Neo/' -e 's/-unsigned//')
+            # ファイル名から不要な文字を除去
+            newname=$(echo "$filename" | sed -e 's/^app/Metrolist-Neo/' -e 's/-unsigned//' -e 's/-release//')
             cp "$f" "output_apks/$newname"
           done
+          ls -l output_apks/
 
-      # 7. 署名 (自動で -signed が付く)
       - name: Sign APK
         if: steps.check.outputs.trigger == 'true'
         uses: ilharp/sign-android-release@v1
@@ -228,22 +349,22 @@ jobs:
           keyPassword: ${{ secrets.KEY_PASSWORD }}
           buildToolsVersion: "34.0.0"
 
-      # 8. リネーム & クリーンアップ
-      # -signed を削除し、余計な -temp ファイルも削除する
-      - name: Rename Signed APKs
+      - name: Finalize Artifacts
         if: steps.check.outputs.trigger == 'true'
         run: |
           cd output_apks
-          
-          # 署名済みファイルの名前を整える
+          # 署名済みファイルを正式名称に変更
           for f in *-signed.apk; do
+            [ -e "$f" ] || continue
             mv "$f" "${f/-signed/}"
           done
-          
-          # 余計なゴミファイル (-temp) を削除
+          # 不要ファイルのクリーンアップ
           rm -f *-temp.apk
+          ls -l
 
-      # 9. リリース
+      # ---------------------------------------------------------
+      # 7. リリース作成
+      # ---------------------------------------------------------
       - name: Create Release
         if: steps.check.outputs.trigger == 'true'
         uses: softprops/action-gh-release@v2
@@ -251,6 +372,9 @@ jobs:
           tag_name: ${{ steps.check.outputs.tag }}
           name: ${{ steps.check.outputs.tag }}
           body: |
+             ### Metrolist Neo
+             Automated build from upstream tag: ${{ steps.check.outputs.tag }}
+             
              Original: https://github.com/mostafaalagamy/Metrolist/releases/tag/${{ steps.check.outputs.tag }}
           files: output_apks/*.apk
           draft: false
