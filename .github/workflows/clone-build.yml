@@ -244,8 +244,47 @@ jobs:
               アプリ名をXMLリソースファイルとして直接書き出す。
               build.gradle.kts の resValue() は buildFeatures.resValues が
               無効な場合に EvalIssueException を引き起こすため使用しない。
+
+              ★堅牢化ポイント:
+              上流は app_name.xml / strings.xml など複数ファイルに
+              app_name を持つ場合がある。全 values* ディレクトリを走査して
+              重複エントリを先にすべて削除してから、strings.xml に一元化する。
               """
               log(f"Writing app_name string resource: {app_name}")
+
+              # --- Step1: res/values* 配下の全 XML から app_name エントリを除去 ---
+              app_name_pattern = re.compile(
+                  r'\s*<string\s+name="app_name"[^>]*>[^<]*</string>', re.MULTILINE
+              )
+              for root, dirs, files in os.walk(RES_DIR):
+                  # values で始まるディレクトリのみ対象
+                  if not os.path.basename(root).startswith('values'):
+                      continue
+                  for fname in files:
+                      if not fname.endswith('.xml'):
+                          continue
+                      fpath = os.path.join(root, fname)
+                      try:
+                          with open(fpath, 'r', encoding='utf-8') as f:
+                              content = f.read()
+                          if 'name="app_name"' not in content:
+                              continue
+                          cleaned = app_name_pattern.sub('', content)
+                          # <resources/> や空の <resources></resources> になったファイルは削除
+                          stripped = re.sub(r'<\?xml[^?]*\?>', '', cleaned).strip()
+                          stripped = re.sub(r'<resources\s*/?>', '', stripped).strip()
+                          stripped = re.sub(r'</resources>', '', stripped).strip()
+                          if not stripped:
+                              os.remove(fpath)
+                              log(f"  Removed empty resource file: {fpath}")
+                          else:
+                              with open(fpath, 'w', encoding='utf-8') as f:
+                                  f.write(cleaned)
+                              log(f"  Removed app_name entry from: {fpath}")
+                      except Exception as e:
+                          log(f"  Warning: could not process {fpath}: {e}")
+
+              # --- Step2: strings.xml に app_name を一元追加 ---
               values_dir = os.path.join(RES_DIR, 'values')
               os.makedirs(values_dir, exist_ok=True)
               strings_path = os.path.join(values_dir, 'strings.xml')
@@ -253,29 +292,33 @@ jobs:
               if os.path.exists(strings_path):
                   with open(strings_path, 'r', encoding='utf-8') as f:
                       content = f.read()
-                  # 既存の app_name エントリを置換
+                  # Step1 で除去済みなので app_name はもう存在しないはずだが念のため
                   if 'name="app_name"' in content:
                       content = re.sub(
-                          r'<string name="app_name">[^<]*</string>',
+                          r'<string\s+name="app_name"[^>]*>[^<]*</string>',
                           f'<string name="app_name">{app_name}</string>',
                           content
                       )
                   else:
-                      # <resources> タグの直後に挿入
-                      content = content.replace(
-                          '<resources>',
-                          f'<resources>\n    <string name="app_name">{app_name}</string>'
+                      content = re.sub(
+                          r'(<resources[^>]*>)',
+                          f'\\1\n    <string name="app_name">{app_name}</string>',
+                          content,
+                          count=1
                       )
                   with open(strings_path, 'w', encoding='utf-8') as f:
                       f.write(content)
               else:
-                  # strings.xml が存在しない場合は新規作成
-                  xml_content = f'''<?xml version="1.0" encoding="utf-8"?>
-          <resources>
-              <string name="app_name">{app_name}</string>
-          </resources>'''
+                  xml_content = (
+                      '<?xml version="1.0" encoding="utf-8"?>\n'
+                      '<resources>\n'
+                      f'    <string name="app_name">{app_name}</string>\n'
+                      '</resources>'
+                  )
                   with open(strings_path, 'w', encoding='utf-8') as f:
                       f.write(xml_content)
+
+              log(f"app_name resource written to {strings_path}")
 
           def update_build_gradle():
               """
