@@ -239,7 +239,52 @@ jobs:
               with open(PROGUARD_FILE, mode) as f:
                   f.write(robust_rules)
 
-          def update_build_gradle(bg_hex):
+          def write_app_name_resource(app_name):
+              """
+              アプリ名をXMLリソースファイルとして直接書き出す。
+              build.gradle.kts の resValue() は buildFeatures.resValues が
+              無効な場合に EvalIssueException を引き起こすため使用しない。
+              """
+              log(f"Writing app_name string resource: {app_name}")
+              values_dir = os.path.join(RES_DIR, 'values')
+              os.makedirs(values_dir, exist_ok=True)
+              strings_path = os.path.join(values_dir, 'strings.xml')
+
+              if os.path.exists(strings_path):
+                  with open(strings_path, 'r', encoding='utf-8') as f:
+                      content = f.read()
+                  # 既存の app_name エントリを置換
+                  if 'name="app_name"' in content:
+                      content = re.sub(
+                          r'<string name="app_name">[^<]*</string>',
+                          f'<string name="app_name">{app_name}</string>',
+                          content
+                      )
+                  else:
+                      # <resources> タグの直後に挿入
+                      content = content.replace(
+                          '<resources>',
+                          f'<resources>\n    <string name="app_name">{app_name}</string>'
+                      )
+                  with open(strings_path, 'w', encoding='utf-8') as f:
+                      f.write(content)
+              else:
+                  # strings.xml が存在しない場合は新規作成
+                  xml_content = f'''<?xml version="1.0" encoding="utf-8"?>
+          <resources>
+              <string name="app_name">{app_name}</string>
+          </resources>'''
+                  with open(strings_path, 'w', encoding='utf-8') as f:
+                      f.write(xml_content)
+
+          def update_build_gradle():
+              """
+              ★修正点:
+                - resValue() の注入を完全に削除
+                  (buildFeatures.resValues=false の場合に EvalIssueException が発生するため)
+              　- アプリ名は write_app_name_resource() で XMLリソースに直接書き出す
+              　- applicationId / google-services プラグイン無効化のみ担当
+              """
               log(f"Patching {GRADLE_FILE}...")
               if not os.path.exists(GRADLE_FILE):
                   error_exit(f"Build file not found: {GRADLE_FILE}")
@@ -247,19 +292,12 @@ jobs:
               with open(GRADLE_FILE, 'r') as f:
                   content = f.read()
 
-              # Application ID の変更 (スペースがあってもマッチする正規表現)
+              # Application ID の変更
               content = re.sub(r'applicationId\s*=\s*"[^"]*"', f'applicationId = "{APP_ID}"', content)
 
               # Google Services プラグインの無効化
               content = re.sub(r'(.*alias\(libs\.plugins\.google\.services\).*)', r'// \1', content)
               content = re.sub(r'(.*id\(\"com\.google\.gms\.google-services\"\).*)', r'// \1', content)
-
-              # リソース値の注入 (defaultConfigブロック内)
-              if 'defaultConfig {' in content:
-                  injection = f'defaultConfig {{ \n        resValue("string", "app_name", "{APP_NAME}") \n        resValue("color", "ic_launcher_background_gradle", "{bg_hex}")'
-                  content = content.replace('defaultConfig {', injection)
-              else:
-                  log("WARNING: defaultConfig block not found in build.gradle.kts")
 
               with open(GRADLE_FILE, 'w') as f:
                   f.write(content)
@@ -280,7 +318,6 @@ jobs:
               if 'android:roundIcon=' in content:
                   content = re.sub(r'android:roundIcon="[^"]*"', 'android:roundIcon="@mipmap/ic_launcher_round"', content)
               else:
-                  # applicationタグに属性を追加
                   content = content.replace('<application', '<application android:roundIcon="@mipmap/ic_launcher_round"')
 
               with open(MANIFEST_FILE, 'w') as f:
@@ -292,7 +329,9 @@ jobs:
                   generate_dummy_google_services()
                   update_gradle_properties()
                   update_proguard_rules()
-                  update_build_gradle(bg_color)
+                  # ★ resValue() を使わず XML リソースにアプリ名を直接書き出す
+                  write_app_name_resource(APP_NAME)
+                  update_build_gradle()
                   update_manifest()
                   log("All modifications applied successfully.")
               except Exception as e:
