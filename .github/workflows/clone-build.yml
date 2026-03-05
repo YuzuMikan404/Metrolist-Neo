@@ -98,7 +98,7 @@ jobs:
             ### Metrolist Neo
             Automated build from upstream tag: ${{ steps.check.outputs.tag }}
 
-            Original: https://github.com/mostafaalagamy/Metrolist/releases/tag/${{ steps.check.outputs.tag }}
+            Original: https://github.com/MetrolistGroup/Metrolist/releases/tag/${{ steps.check.outputs.tag }}
           files: output_apks/*.apk
           draft: false
           prerelease: false
