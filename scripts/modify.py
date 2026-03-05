@@ -6,67 +6,61 @@ Patches the checked-out Metrolist source so it can be built as
 
 What this script does
 ─────────────────────
-1. process_icon()              — generate adaptive + legacy launcher icons
-2. gen_google_services()       — write a dummy google-services.json
-3. patch_gradle_properties()   — merge CI-friendly JVM / build settings
-4. patch_proguard()            — append -dontwarn rules
-5. write_app_name()            — deduplicate app_name → strings.xml
-6. patch_root_build_gradle()   — ensure protobuf is declared with apply false
-                                 at the ROOT level (required for alias resolution)
-7. patch_build_gradle()        — change applicationId; activate protobuf plugin;
-                                 disable google-services / firebase plugins
-8. patch_manifest()            — update label / icon / roundIcon attributes
+1. process_icon()           — generate adaptive + legacy launcher icons
+2. gen_google_services()    — write a dummy google-services.json
+3. patch_gradle_properties()— merge CI-friendly JVM / build settings
+4. patch_proguard()         — append -dontwarn rules
+5. write_app_name()         — deduplicate app_name → strings.xml
+6. patch_build_gradle()     — change applicationId; disable GMS/Firebase plugins
+7. patch_manifest()         — update label / icon / roundIcon attributes
+8. replace_message_codec()  — overwrite the broken MessageCodec.kt with a correct
+                              kotlinx.serialization-based implementation
 
-Root cause (v13.2.1 regression) + fix
-──────────────────────────────────────
-upstream v13.2.1 removed the `protobuf` plugin from BOTH:
-  • the root build.gradle.kts plugins{} block (apply false declaration)
-  • the app/build.gradle.kts plugins{} block (active use declaration)
+Root cause analysis (v13.2.1)
+──────────────────────────────
+The upstream removed the protobuf Gradle plugin AND the proto-generated Java/Kotlin
+sources, but left MessageCodec.kt referencing the old proto outer class
+"Listentogether" and the generated "proto" package.  All other files in the
+listentogether/ package were rewritten to use plain @Serializable Kotlin data
+classes — only MessageCodec.kt was missed.
 
-Without these declarations:
-  • generateProto never runs
-  • MessageCodec.kt fails: "Unresolved reference: proto / Listentogether"
+Previous fix attempts (injecting the protobuf Gradle plugin) all failed because:
+  • The TOML version "4.33.5" is the protobuf *library* version, not the plugin
+  • The Gradle plugin com.google.protobuf.gradle.plugin has a separate 0.9.x version
+  • There is no [plugins] entry for protobuf in libs.versions.toml at all
+  • Injecting bare id("com.google.protobuf") fails (no version, not in root)
+  • Injecting with version "4.33.5" fails (that artifact does not exist)
 
-Fix applied in two steps:
-  Step 1 (patch_root_build_gradle): inject
-      alias(libs.plugins.protobuf) apply false
-    into the ROOT plugins{} block so Gradle can resolve the plugin from the
-    version catalogue without requiring an inline version number.
-
-  Step 2 (patch_build_gradle): inject
-      alias(libs.plugins.protobuf)
-    into the APP plugins{} block so the generateProto task is registered.
-
-  Fallback: if the version catalogue alias cannot be confirmed, falls back to
-      id("com.google.protobuf") version "<detected-or-default>"
-    using the version parsed from gradle/libs.versions.toml.
-
-Edit the CONFIG section below to customise the build.
+Correct fix: replace MessageCodec.kt entirely.  The new implementation uses
+kotlinx.serialization JSON (already a project dependency) to encode/decode
+messages — matching exactly the data-class API that all the other
+listentogether/ files expose.
 """
 
-import json
+import json as _json
 import os
 import re
 import shutil
 import sys
+import textwrap
 
 # ──────────────────────────────────────────────────────────────
-# CONFIG  ← only section you normally need to edit
+# CONFIG
 # ──────────────────────────────────────────────────────────────
 APP_NAME = "Metrolist Neo"
 APP_ID   = "com.metrolist.clone"
 
-ICON_SRC        = "icon.png"
-BASE_DIR        = "app"
-RES_DIR         = os.path.join(BASE_DIR, "src/main/res")
-GRADLE_FILE     = os.path.join(BASE_DIR, "build.gradle.kts")
-ROOT_GRADLE     = "build.gradle.kts"
-VERSIONS_TOML   = os.path.join("gradle", "libs.versions.toml")
-MANIFEST_FILE   = os.path.join(BASE_DIR, "src/main/AndroidManifest.xml")
-PROGUARD_FILE   = os.path.join(BASE_DIR, "proguard-rules.pro")
+ICON_SRC       = "icon.png"
+BASE_DIR       = "app"
+RES_DIR        = os.path.join(BASE_DIR, "src/main/res")
+GRADLE_FILE    = os.path.join(BASE_DIR, "build.gradle.kts")
+MANIFEST_FILE  = os.path.join(BASE_DIR, "src/main/AndroidManifest.xml")
+PROGUARD_FILE  = os.path.join(BASE_DIR, "proguard-rules.pro")
 
-# Fallback protobuf plugin version if TOML cannot be parsed
-_PROTOBUF_FALLBACK_VERSION = "0.9.4"
+MESSAGE_CODEC_PATH = os.path.join(
+    BASE_DIR,
+    "src/main/kotlin/com/metrolist/music/listentogether/MessageCodec.kt",
+)
 # ──────────────────────────────────────────────────────────────
 
 try:
@@ -85,84 +79,7 @@ def die(msg: str) -> None:
     sys.exit(1)
 
 
-# ── Helper: read protobuf plugin info from version catalogue ──
-def _protobuf_plugin_info() -> dict:
-    """
-    Parse gradle/libs.versions.toml to find the protobuf plugin alias and version.
-    Returns dict with keys:
-      'alias'   — e.g. 'libs.plugins.protobuf'  (None if not found)
-      'version' — e.g. '0.9.4'                  (fallback if not found)
-    """
-    alias = None
-    version = _PROTOBUF_FALLBACK_VERSION
-
-    if not os.path.exists(VERSIONS_TOML):
-        log(f"  {VERSIONS_TOML} not found — using fallback version {version}")
-        return {"alias": alias, "version": version}
-
-    try:
-        txt = open(VERSIONS_TOML, "r", encoding="utf-8").read()
-
-        # ── Find version ──────────────────────────────────────
-        # Patterns like:  protobuf = "0.9.4"
-        #                 protobuf-plugin = "0.9.4"
-        #                 protobufPlugin = "0.9.4"
-        vm = re.search(
-            r'^\s*protobuf[^\s=]*\s*=\s*"([0-9][^"]+)"',
-            txt, re.MULTILINE | re.IGNORECASE
-        )
-        if vm:
-            version = vm.group(1)
-            log(f"  TOML protobuf version: {version}")
-        else:
-            log(f"  protobuf version not found in TOML — using fallback {version}")
-
-        # ── Find [plugins] alias ──────────────────────────────
-        # Look for a plugins section entry referencing com.google.protobuf
-        # Pattern: someAlias = { id = "com.google.protobuf", ... }
-        # OR:      someAlias = "com.google.protobuf:..."
-        pm = re.search(
-            r'^\s*([a-zA-Z0-9_-]+)\s*=\s*\{[^}]*id\s*=\s*"com\.google\.protobuf"[^}]*\}',
-            txt, re.MULTILINE
-        )
-        if not pm:
-            pm = re.search(
-                r'^\s*([a-zA-Z0-9_-]+)\s*=\s*"com\.google\.protobuf[^"]*"',
-                txt, re.MULTILINE
-            )
-        if pm:
-            # Convert TOML key (dashes/underscores) to Gradle alias dot notation
-            raw = pm.group(1).replace("-", ".").replace("_", ".")
-            alias = f"libs.plugins.{raw}"
-            log(f"  TOML protobuf plugin alias: {alias}")
-        else:
-            log("  protobuf plugin alias not found in TOML [plugins] section")
-
-    except Exception as exc:
-        log(f"  Warning — could not parse {VERSIONS_TOML}: {exc}")
-
-    return {"alias": alias, "version": version}
-
-
-def _protobuf_active_line(info: dict) -> str:
-    """Return the plugins{} line to ACTIVATE protobuf (no apply false)."""
-    if info["alias"]:
-        return f'    alias({info["alias"]})\n'
-    return f'    id("com.google.protobuf") version "{info["version"]}"\n'
-
-
-def _protobuf_disabled_line(info: dict) -> str:
-    """Return the plugins{} line to DECLARE protobuf with apply false (root level)."""
-    if info["alias"]:
-        return f'    alias({info["alias"]}) apply false\n'
-    return f'    id("com.google.protobuf") version "{info["version"]}" apply false\n'
-
-
-def _block_has_protobuf(block_content: str) -> bool:
-    return bool(re.search(r'protobuf', block_content, re.IGNORECASE))
-
-
-# ── 1. Icon ────────────────────────────────────────────────────
+# ── 1. Icon ───────────────────────────────────────────────────
 def process_icon() -> str:
     log("Processing icon...")
     if not PIL_OK or not os.path.exists(ICON_SRC):
@@ -235,15 +152,11 @@ def gen_google_services() -> None:
         "configuration_version": "1",
     }
     with open(os.path.join(BASE_DIR, "google-services.json"), "w") as fh:
-        json.dump(data, fh, indent=2)
+        _json.dump(data, fh, indent=2)
 
 
 # ── 3. gradle.properties ──────────────────────────────────────
 def patch_gradle_properties() -> None:
-    """
-    Merge CI-friendly settings. android.enableJetifier must stay FALSE:
-    Jetifier corrupts protobuf-generated class names.
-    """
     log("Patching gradle.properties...")
     desired = {
         "org.gradle.jvmargs": (
@@ -345,85 +258,10 @@ def write_app_name(name: str) -> None:
     log(f"app_name written to {sp}")
 
 
-# ── 6. ROOT build.gradle.kts ──────────────────────────────────
-#
-# WHY this is needed (v13.2.1 regression):
-#   In Gradle's plugins{} DSL, a plugin referenced by id() without a version
-#   MUST be declared in the ROOT build.gradle.kts with `apply false` first.
-#   In v13.2.1, protobuf was removed from BOTH the root AND app build files,
-#   breaking plugin resolution entirely.
-#
-#   By re-adding it to the root with `apply false`, Gradle can resolve the
-#   plugin from the version catalogue and the app-level plugins{} block can
-#   reference it without repeating the version number.
-
-def patch_root_build_gradle(info: dict) -> None:
-    """
-    Ensure the ROOT build.gradle.kts declares the protobuf plugin with apply false.
-    This is a prerequisite for the app-level plugins{} block to reference it
-    without an inline version number.
-    """
-    log(f"Patching {ROOT_GRADLE} (root)...")
-    if not os.path.exists(ROOT_GRADLE):
-        log(f"  {ROOT_GRADLE} not found — skipping root patch.")
-        return
-
-    txt = open(ROOT_GRADLE, "r").read()
-    original = txt
-
-    # Check if protobuf is already declared at root level
-    if _block_has_protobuf(txt):
-        log(f"  protobuf already present in {ROOT_GRADLE} — no change needed.")
-        return
-
-    inject_line = _protobuf_disabled_line(info)
-    log(f"  Injecting into root plugins{{}}: {inject_line.strip()}")
-
-    # Find the root plugins{} block and inject before its closing brace
-    in_block = False
-    brace_depth = 0
-    lines, out = txt.splitlines(keepends=True), []
-    injected = False
-
-    for line in lines:
-        stripped = line.lstrip()
-        if re.match(r'plugins\s*\{', stripped) and not in_block:
-            in_block = True
-            brace_depth = 1
-            out.append(line)
-            continue
-        if in_block:
-            brace_depth += line.count("{") - line.count("}")
-            if brace_depth <= 0:
-                out.append(inject_line)
-                in_block = False
-                injected = True
-                out.append(line)
-                continue
-        out.append(line)
-
-    if not injected:
-        log(f"  WARNING: could not find plugins{{}} block in {ROOT_GRADLE}")
-        return
-
-    txt = "".join(out)
-    if txt != original:
-        open(ROOT_GRADLE, "w").write(txt)
-        log(f"  {ROOT_GRADLE} patched.")
-    else:
-        log(f"  WARNING: {ROOT_GRADLE} unchanged.")
-
-
-# ── 7. app/build.gradle.kts ───────────────────────────────────
-#
-# Plugin handling strategy
-# ────────────────────────
-# google-services / firebase  →  add "apply false"
-# protobuf (present)          →  remove "apply false" to activate
-# protobuf (absent)           →  INJECT active line (alias or versioned id)
-#
-# The injection uses alias(libs.plugins.protobuf) if the alias was found in
-# the version catalogue, otherwise id("com.google.protobuf") version "X.Y.Z".
+# ── 6. app/build.gradle.kts ───────────────────────────────────
+# Only disable GMS/Firebase — do NOT touch protobuf at all.
+# The protobuf Gradle plugin is not needed because we replace MessageCodec.kt
+# with a pure kotlinx.serialization implementation.
 
 _GMS_PATTERNS = [
     r'alias\s*\(\s*libs\.plugins\.google\.services\s*\)',
@@ -433,36 +271,14 @@ _GMS_PATTERNS = [
     r'id\s*\(\s*["\']com\.google\.firebase\.[^"\']+["\']\s*\)',
 ]
 
-_MUST_ENABLE_PATTERNS = [r'protobuf']
 
-
-def patch_build_gradle(info: dict) -> None:
-    """
-    1. Dump plugins{} block for diagnostics.
-    2. Replace applicationId with APP_ID.
-    3. Ensure protobuf plugin is ACTIVE (remove 'apply false' if present,
-       or INJECT if completely absent).
-    4. Add 'apply false' to google-services / firebase lines.
-    5. Post-patch validation.
-    """
+def patch_build_gradle() -> None:
     log(f"Patching {GRADLE_FILE}...")
     if not os.path.exists(GRADLE_FILE):
         die(f"File not found: {GRADLE_FILE}")
 
     txt = open(GRADLE_FILE, "r").read()
     original = txt
-
-    # Diagnostics
-    plugins_m = re.search(r'plugins\s*\{([^}]*)\}', txt, re.DOTALL)
-    if plugins_m:
-        block_content = plugins_m.group(1)
-        log("  plugins{} block found:")
-        for l in block_content.splitlines():
-            if l.strip():
-                log(f"    {l.strip()}")
-        log(f"  protobuf present in plugins{{}}: {_block_has_protobuf(block_content)}")
-    else:
-        log("  WARNING: no plugins{} block found")
 
     # applicationId
     txt = re.sub(
@@ -471,49 +287,34 @@ def patch_build_gradle(info: dict) -> None:
         txt,
     )
 
-    # Process plugins{} block line by line
-    in_plugins_block = False
+    # Diagnostics
+    plugins_m = re.search(r'plugins\s*\{([^}]*)\}', txt, re.DOTALL)
+    if plugins_m:
+        log("  plugins{} block found:")
+        for line in plugins_m.group(1).splitlines():
+            if line.strip():
+                log(f"    {line.strip()}")
+    else:
+        log("  WARNING: no plugins{} block found")
+
+    # Disable GMS/Firebase only — leave everything else untouched
+    in_block = False
     brace_depth = 0
     lines, out = txt.splitlines(keepends=True), []
-    protobuf_handled = False
-    inject_line = _protobuf_active_line(info)
 
     for line in lines:
         stripped = line.lstrip()
-
         if re.match(r'plugins\s*\{', stripped):
-            in_plugins_block = True
+            in_block = True
             brace_depth = 1
-            protobuf_handled = False
             out.append(line)
             continue
-
-        if in_plugins_block:
+        if in_block:
             brace_depth += line.count("{") - line.count("}")
             if brace_depth <= 0:
-                if not protobuf_handled:
-                    log(
-                        f"  protobuf NOT in plugins{{}} — injecting: {inject_line.strip()}"
-                    )
-                    out.append(inject_line)
-                    protobuf_handled = True
-                in_plugins_block = False
+                in_block = False
                 out.append(line)
                 continue
-
-            # Ensure protobuf is active
-            if any(re.search(p, line) for p in _MUST_ENABLE_PATTERNS):
-                protobuf_handled = True
-                if re.search(r'\bapply\s+false\b', line):
-                    fixed = re.sub(r'\s*apply\s+false', '', line)
-                    out.append(fixed)
-                    log(f"  Enabled protobuf: {line.strip()} → {fixed.strip()}")
-                else:
-                    out.append(line)
-                    log(f"  protobuf already active: {line.strip()}")
-                continue
-
-            # Disable GMS/Firebase
             if not stripped.startswith("//") and not re.search(r'\bapply\s+false\b', line):
                 for pat in _GMS_PATTERNS:
                     if re.search(pat, line):
@@ -526,28 +327,17 @@ def patch_build_gradle(info: dict) -> None:
             else:
                 out.append(line)
             continue
-
         out.append(line)
 
     txt = "".join(out)
-
     if txt != original:
         open(GRADLE_FILE, "w").write(txt)
         log(f"{GRADLE_FILE} patched.")
     else:
-        log(f"WARNING: {GRADLE_FILE} unchanged.")
-
-    # Post-patch validation
-    final_m = re.search(r'plugins\s*\{([^}]*)\}', open(GRADLE_FILE).read(), re.DOTALL)
-    if final_m:
-        if not _block_has_protobuf(final_m.group(1)):
-            die("VALIDATION FAILED: protobuf still absent from app plugins{} after patching.")
-        log("  VALIDATION OK: protobuf active in app plugins{} block.")
-    else:
-        log("  WARNING: could not re-validate app plugins{} block.")
+        log(f"{GRADLE_FILE} — no changes needed.")
 
 
-# ── 8. AndroidManifest.xml ────────────────────────────────────
+# ── 7. AndroidManifest.xml ────────────────────────────────────
 def patch_manifest() -> None:
     log(f"Patching {MANIFEST_FILE}...")
     if not os.path.exists(MANIFEST_FILE):
@@ -570,7 +360,147 @@ def patch_manifest() -> None:
     open(MANIFEST_FILE, "w").write(txt)
 
 
-# ── Main ───────────────────────────────────────────────────────
+# ── 8. Replace broken MessageCodec.kt ────────────────────────
+#
+# Root cause:
+#   In v13.2.1 the upstream removed all proto-generated sources and rewrote
+#   the listentogether/ package to use plain @Serializable Kotlin data classes.
+#   However, MessageCodec.kt was accidentally left with the old protobuf-based
+#   implementation that references the now-deleted outer class "Listentogether"
+#   and the "proto" import package.
+#
+# Fix:
+#   Replace the file entirely with a correct implementation that uses
+#   kotlinx.serialization JSON — the same serialization library already used
+#   throughout the rest of the project. The public API surface (function names
+#   and parameter/return types) matches exactly what the other files expect.
+
+_MESSAGE_CODEC_SOURCE = textwrap.dedent("""\
+    package com.metrolist.music.listentogether
+
+    import kotlinx.serialization.encodeToString
+    import kotlinx.serialization.json.Json
+    import kotlinx.serialization.json.JsonElement
+    import kotlinx.serialization.json.decodeFromJsonElement
+    import kotlinx.serialization.json.encodeToJsonElement
+    import kotlinx.serialization.json.jsonObject
+    import kotlinx.serialization.json.jsonPrimitive
+
+    /**
+     * MessageCodec — encodes and decodes ListenTogether wire messages.
+     *
+     * Replaced the old protobuf-based implementation (Listentogether.Message /
+     * com.metrolist.music.listentogether.proto.*) which was removed in v13.2.1.
+     * Uses kotlinx.serialization JSON over UTF-8 ByteArray.
+     * Wire envelope: { "type": "...", "payload": { ... } }
+     */
+    object MessageCodec {
+
+        private val json = Json {
+            ignoreUnknownKeys = true
+            encodeDefaults = false
+            isLenient = true
+        }
+
+        // ── Wire envelope ─────────────────────────────────────────────────
+
+        fun encode(type: String, payload: JsonElement): ByteArray =
+            json.encodeToString(
+                mapOf("type" to json.encodeToJsonElement(type), "payload" to payload)
+            ).toByteArray(Charsets.UTF_8)
+
+        fun decode(bytes: ByteArray): Pair<String, JsonElement>? = runCatching {
+            val root = json.parseToJsonElement(bytes.toString(Charsets.UTF_8)).jsonObject
+            val type = root["type"]?.jsonPrimitive?.content ?: return null
+            val payload = root["payload"] ?: return null
+            type to payload
+        }.getOrNull()
+
+        // ── Encode helpers ────────────────────────────────────────────────
+
+        fun encodePlaybackAction(payload: PlaybackActionPayload): ByteArray =
+            encode("PLAYBACK_ACTION", json.encodeToJsonElement(payload))
+
+        fun encodeSyncState(payload: SyncStatePayload): ByteArray =
+            encode("SYNC_STATE", json.encodeToJsonElement(payload))
+
+        fun encodeSuggestionRejected(payload: SuggestionRejectedPayload): ByteArray =
+            encode("SUGGESTION_REJECTED", json.encodeToJsonElement(payload))
+
+        fun encodeRoomState(state: RoomState): ByteArray =
+            encode("ROOM_STATE", json.encodeToJsonElement(state))
+
+        // ── Decode helpers ────────────────────────────────────────────────
+
+        fun decodePlaybackAction(bytes: ByteArray): PlaybackActionPayload? =
+            decodePayload(bytes)
+
+        fun decodeSyncState(bytes: ByteArray): SyncStatePayload? =
+            decodePayload(bytes)
+
+        fun decodeSuggestionRejected(bytes: ByteArray): SuggestionRejectedPayload? =
+            decodePayload(bytes)
+
+        fun decodeRoomState(bytes: ByteArray): RoomState? =
+            decodePayload(bytes)
+
+        // ── Conversion helpers ────────────────────────────────────────────
+
+        fun trackInfoToBytes(track: TrackInfo): ByteArray =
+            encode("TRACK_INFO", json.encodeToJsonElement(track))
+
+        fun trackInfoFromBytes(bytes: ByteArray): TrackInfo? =
+            decodePayload(bytes)
+
+        fun roomStateToBytes(state: RoomState): ByteArray =
+            encodeRoomState(state)
+
+        fun roomStateFromBytes(bytes: ByteArray): RoomState? =
+            decodeRoomState(bytes)
+
+        private inline fun <reified T> decodePayload(bytes: ByteArray): T? =
+            runCatching {
+                val (_, payload) = decode(bytes) ?: return null
+                json.decodeFromJsonElement<T>(payload)
+            }.getOrNull()
+    }
+""")
+
+
+def replace_message_codec() -> None:
+    """
+    Overwrite MessageCodec.kt with a kotlinx.serialization-based implementation.
+
+    The upstream file at v13.2.1 references:
+      - import com.metrolist.music.listentogether.proto.*  (package deleted)
+      - Listentogether.Message / Listentogether.PlaybackAction etc. (class deleted)
+      - Proto builder/parser methods (parseFrom, newBuilder, build, etc.)
+      - Proto field accessors with legacy names (usersList, queueList, userId, etc.)
+
+    None of these exist in v13.2.1; the replacement uses the Kotlin data classes
+    that are already correctly defined in the other listentogether/ source files.
+    """
+    if not os.path.exists(MESSAGE_CODEC_PATH):
+        log(f"  WARNING: {MESSAGE_CODEC_PATH} not found — skipping replacement.")
+        log("  (This is unexpected; the build may have other issues.)")
+        return
+
+    # Verify the file actually needs replacing (contains the broken proto import)
+    existing = open(MESSAGE_CODEC_PATH, "r", encoding="utf-8").read()
+    if "listentogether.proto" in existing or "Listentogether" in existing:
+        open(MESSAGE_CODEC_PATH, "w", encoding="utf-8").write(_MESSAGE_CODEC_SOURCE)
+        log(f"  Replaced broken proto-based {MESSAGE_CODEC_PATH} with")
+        log("  kotlinx.serialization JSON implementation.")
+    elif "MessageCodec" in existing and "kotlinx.serialization" in existing:
+        log(f"  {MESSAGE_CODEC_PATH} already uses kotlinx.serialization — no change.")
+    else:
+        # File exists but doesn't match either pattern — replace to be safe
+        open(MESSAGE_CODEC_PATH, "w", encoding="utf-8").write(_MESSAGE_CODEC_SOURCE)
+        log(f"  Replaced unrecognised {MESSAGE_CODEC_PATH} with")
+        log("  kotlinx.serialization JSON implementation.")
+
+
+# ── Main ──────────────────────────────────────────────────────
 if __name__ == "__main__":
     try:
         process_icon()
@@ -578,11 +508,9 @@ if __name__ == "__main__":
         patch_gradle_properties()
         patch_proguard()
         write_app_name(APP_NAME)
-        # Resolve protobuf plugin info once; share across both gradle patches
-        proto_info = _protobuf_plugin_info()
-        patch_root_build_gradle(proto_info)
-        patch_build_gradle(proto_info)
+        patch_build_gradle()
         patch_manifest()
+        replace_message_codec()
         log("All modifications applied successfully.")
     except SystemExit:
         raise
