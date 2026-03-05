@@ -45,17 +45,17 @@ jobs:
         id: check
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: bash .github/scripts/check-updates.sh
+        run: bash scripts/check-updates.sh
 
       # ── 4. Fetch upstream source at the detected tag ──────────
       - name: Fetch Source
         if: steps.check.outputs.trigger == 'true'
-        run: bash .github/scripts/fetch-source.sh "${{ steps.check.outputs.tag }}"
+        run: bash scripts/fetch-source.sh "${{ steps.check.outputs.tag }}"
 
       # ── 5. Patch source (Python — no shell escaping issues) ───
       - name: Apply Modifications
         if: steps.check.outputs.trigger == 'true'
-        run: python3 .github/scripts/modify.py
+        run: python3 scripts/modify.py
 
       # ── 6. Build ──────────────────────────────────────────────
       - name: Build APK
@@ -64,12 +64,12 @@ jobs:
           GITHUB_EVENT_NAME: pull_request
           LASTFM_API_KEY: "dummy"
           LASTFM_SECRET: "dummy"
-        run: bash .github/scripts/build.sh
+        run: bash scripts/build.sh
 
       # ── 7. Sign ───────────────────────────────────────────────
       - name: Collect APKs
         if: steps.check.outputs.trigger == 'true'
-        run: bash .github/scripts/collect-apks.sh
+        run: bash scripts/collect-apks.sh
 
       - name: Sign APK
         if: steps.check.outputs.trigger == 'true'
@@ -85,7 +85,7 @@ jobs:
 
       - name: Finalize Artifacts
         if: steps.check.outputs.trigger == 'true'
-        run: bash .github/scripts/finalize-apks.sh
+        run: bash scripts/finalize-apks.sh
 
       # ── 8. Release ────────────────────────────────────────────
       - name: Create Release
