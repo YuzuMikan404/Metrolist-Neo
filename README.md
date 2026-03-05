@@ -8,7 +8,7 @@
 ソースコードは本家から持ってきているのでこのリポジトリのコードの更新はありません。自分用なので、使う方は自己責任で使ってください。不具合の修正や機能の追加等は行いません。予告なく変更をすることがあります。
 </div>
 
-<h2>フォーク元</h2>
-mostafaalagamy氏のMetrolist
+<h2>クローン元</h2>
+Metrolist
 
-https://github.com/mostafaalagamy/Metrolist
+https://github.com/MetrolistGroup/Metrolist
