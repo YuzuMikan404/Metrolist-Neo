@@ -20,14 +20,17 @@ scripts/modify.py  —  Metrolist Neo build patcher
 
 import os
 import re
-import shutil
 import sys
 
 # ── CONFIG ────────────────────────────────────────────────────
 APP_NAME = "Metrolist Neo"
 APP_ID   = "com.metrolist.clone"
 
-ICON_SRC      = "icon.png"
+# アイコンの色設定
+ICON_BG_START  = "#0055AA"   # グラデーション開始色（濃い青）
+ICON_BG_END    = "#00ACEE"   # グラデーション終了色（シアン）
+ICON_FG_COLOR  = "#FFFFFFFF" # 前景（矢印）の色
+
 BASE_DIR      = "app"
 RES_DIR       = os.path.join(BASE_DIR, "src/main/res")
 GRADLE_FILE   = os.path.join(BASE_DIR, "build.gradle.kts")
@@ -40,13 +43,6 @@ MESSAGE_CODEC_PATH = os.path.join(
 )
 # ─────────────────────────────────────────────────────────────
 
-try:
-    from PIL import Image, ImageOps
-    PIL_OK = True
-except ImportError:
-    PIL_OK = False
-
-
 def log(msg):
     print(f"[modify.py] {msg}", flush=True)
 
@@ -55,62 +51,55 @@ def die(msg):
     sys.exit(1)
 
 
-# ── 1. アイコン ───────────────────────────────────────────────
-def process_icon():
-    log("Processing icon...")
-    if not PIL_OK or not os.path.exists(ICON_SRC):
-        log("Skipping — PIL unavailable or no icon.png found.")
-        return
-    try:
-        img = Image.open(ICON_SRC).convert("RGBA")
-        pixel = img.resize((1, 1)).getpixel((0, 0))
-        bg = "#{:02x}{:02x}{:02x}".format(*pixel[:3]) if pixel[3] > 0 else "#000000"
+# ── 1. アイコン色変更 ─────────────────────────────────────────
+# 元の XML ベクターアイコンをそのまま使い、色だけ書き換える。
+# 画像ファイル不要。upstream のアイコン構造を維持しつつ色だけ変更する。
+#
+# 変更対象:
+#   drawable/ic_launcher_background_v31.xml     → グラデーション色
+#   drawable-v31/ic_launcher_background_v31.xml → グラデーション色
+#   drawable/ic_launcher_foreground.xml         → 矢印の stroke 色
+#   drawable/ic_launcher_foreground_v31.xml     → 矢印の stroke 色
+#   values/ic_launcher_background.xml           → フォールバック単色
 
-        sz, tg = 1080, int(1080 * 0.65)
-        canvas = Image.new("RGBA", (sz, sz), (0, 0, 0, 0))
-        resized = ImageOps.fit(img, (tg, tg), centering=(0.5, 0.5))
-        off = (sz - tg) // 2
-        canvas.paste(resized, (off, off), resized)
-        canvas.save("_ic_fg.png")
-        img.save("_ic_lg.png")
+def patch_icon_colors():
+    log(f"Patching icon colors (bg: {ICON_BG_START}\u2192{ICON_BG_END}, fg: {ICON_FG_COLOR})...")
 
-        for root, _, files in os.walk(RES_DIR):
-            for f in files:
-                if "ic_launcher" in f:
-                    os.remove(os.path.join(root, f))
+    bg_gradient_xml = (
+        '<?xml version="1.0" encoding="utf-8"?>\n'
+        '<shape xmlns:android="http://schemas.android.com/apk/res/android">\n'
+        '    <gradient\n'
+        '        android:angle="45.0"\n'
+        f'        android:startColor="{ICON_BG_START}"\n'
+        f'        android:endColor="{ICON_BG_END}"\n'
+        '        android:type="linear" />\n'
+        '</shape>'
+    )
 
-        for d in (
-            os.path.join(RES_DIR, "mipmap-anydpi-v26"),
-            os.path.join(RES_DIR, "mipmap-xxxhdpi"),
-            os.path.join(RES_DIR, "values"),
-            os.path.join(RES_DIR, "drawable"),
-        ):
-            os.makedirs(d, exist_ok=True)
+    for rel in ("drawable/ic_launcher_background_v31.xml",
+                "drawable-v31/ic_launcher_background_v31.xml"):
+        path = os.path.join(RES_DIR, rel)
+        if os.path.exists(path):
+            open(path, "w", encoding="utf-8").write(bg_gradient_xml)
+            log(f"  Updated: {rel}")
 
-        adaptive_xml = "\n".join([
-            '<?xml version="1.0" encoding="utf-8"?>',
-            '<adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">',
-            '    <background android:drawable="@color/ic_launcher_background" />',
-            '    <foreground android:drawable="@mipmap/ic_launcher_foreground" />',
-            "</adaptive-icon>",
-        ])
-        anydpi = os.path.join(RES_DIR, "mipmap-anydpi-v26")
-        for name in ("ic_launcher.xml", "ic_launcher_round.xml"):
-            open(os.path.join(anydpi, name), "w").write(adaptive_xml)
+    bg_color_path = os.path.join(RES_DIR, "values/ic_launcher_background.xml")
+    if os.path.exists(bg_color_path):
+        txt = open(bg_color_path, encoding="utf-8").read()
+        txt = re.sub(r'<color name="ic_launcher_background">[^<]*</color>',
+                     f'<color name="ic_launcher_background">{ICON_BG_START}</color>', txt)
+        open(bg_color_path, "w", encoding="utf-8").write(txt)
+        log("  Updated: values/ic_launcher_background.xml")
 
-        open(os.path.join(RES_DIR, "values", "ic_launcher_background.xml"), "w").write(
-            '<?xml version="1.0" encoding="utf-8"?>\n'
-            f"<resources><color name=\"ic_launcher_background\">{bg}</color></resources>"
-        )
-        xhd = os.path.join(RES_DIR, "mipmap-xxxhdpi")
-        drw = os.path.join(RES_DIR, "drawable")
-        shutil.copy("_ic_fg.png", os.path.join(xhd, "ic_launcher_foreground.png"))
-        shutil.copy("_ic_fg.png", os.path.join(drw, "ic_launcher_foreground.png"))
-        shutil.copy("_ic_lg.png", os.path.join(xhd, "ic_launcher.png"))
-        shutil.copy("_ic_lg.png", os.path.join(xhd, "ic_launcher_round.png"))
-        log(f"Icon done. Background: {bg}")
-    except Exception as exc:
-        log(f"Icon processing failed: {exc}")
+    for rel in ("drawable/ic_launcher_foreground.xml",
+                "drawable/ic_launcher_foreground_v31.xml"):
+        path = os.path.join(RES_DIR, rel)
+        if os.path.exists(path):
+            txt = open(path, encoding="utf-8").read()
+            txt = re.sub(r'android:strokeColor="[^"]*"',
+                         f'android:strokeColor="{ICON_FG_COLOR}"', txt)
+            open(path, "w", encoding="utf-8").write(txt)
+            log(f"  Updated: {rel}")
 
 
 # ── 2. applicationId ─────────────────────────────────────────
@@ -382,7 +371,7 @@ def patch_gradle_properties():
 # ── Main ─────────────────────────────────────────────────────
 if __name__ == "__main__":
     try:
-        process_icon()
+        patch_icon_colors()
         patch_application_id()
         write_app_name()
         patch_manifest()
