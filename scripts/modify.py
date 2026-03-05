@@ -16,25 +16,23 @@ What this script does
 8. replace_message_codec()  — overwrite the broken MessageCodec.kt with a correct
                               kotlinx.serialization-based implementation
 
-Root cause analysis (v13.2.1)
-──────────────────────────────
-The upstream removed the protobuf Gradle plugin AND the proto-generated Java/Kotlin
-sources, but left MessageCodec.kt referencing the old proto outer class
-"Listentogether" and the generated "proto" package.  All other files in the
-listentogether/ package were rewritten to use plain @Serializable Kotlin data
-classes — only MessageCodec.kt was missed.
+Root cause (v13.2.1)
+─────────────────────
+The upstream removed all protobuf-generated sources and the protobuf Gradle
+plugin, but left MessageCodec.kt using the old proto API:
+  - import com.metrolist.music.listentogether.proto.*  (package deleted)
+  - Listentogether.Envelope / .parseFrom / .newBuilder  (classes deleted)
+  - com.google.protobuf.MessageLite  (dependency removed)
 
-Previous fix attempts (injecting the protobuf Gradle plugin) all failed because:
-  • The TOML version "4.33.5" is the protobuf *library* version, not the plugin
-  • The Gradle plugin com.google.protobuf.gradle.plugin has a separate 0.9.x version
-  • There is no [plugins] entry for protobuf in libs.versions.toml at all
-  • Injecting bare id("com.google.protobuf") fails (no version, not in root)
-  • Injecting with version "4.33.5" fails (that artifact does not exist)
+All other files in listentogether/ were correctly rewritten to use plain
+@Serializable Kotlin data classes from Protocol.kt.
 
-Correct fix: replace MessageCodec.kt entirely.  The new implementation uses
-kotlinx.serialization JSON (already a project dependency) to encode/decode
-messages — matching exactly the data-class API that all the other
-listentogether/ files expose.
+Fix: replace MessageCodec.kt entirely with a kotlinx.serialization JSON
+implementation that has the exact same public API:
+  - MessageCodec(compressionEnabled: Boolean)
+  - fun encode(msgType: String, payload: Any?): ByteArray
+  - fun decode(data: ByteArray): Pair<String, ByteArray>
+  - fun decodePayload(msgType: String, payloadBytes: ByteArray): Any?
 """
 
 import json as _json
@@ -259,10 +257,6 @@ def write_app_name(name: str) -> None:
 
 
 # ── 6. app/build.gradle.kts ───────────────────────────────────
-# Only disable GMS/Firebase — do NOT touch protobuf at all.
-# The protobuf Gradle plugin is not needed because we replace MessageCodec.kt
-# with a pure kotlinx.serialization implementation.
-
 _GMS_PATTERNS = [
     r'alias\s*\(\s*libs\.plugins\.google\.services\s*\)',
     r'id\s*\(\s*["\']com\.google\.gms\.google-services["\']\s*\)',
@@ -297,7 +291,7 @@ def patch_build_gradle() -> None:
     else:
         log("  WARNING: no plugins{} block found")
 
-    # Disable GMS/Firebase only — leave everything else untouched
+    # Disable GMS/Firebase only
     in_block = False
     brace_depth = 0
     lines, out = txt.splitlines(keepends=True), []
@@ -362,142 +356,188 @@ def patch_manifest() -> None:
 
 # ── 8. Replace broken MessageCodec.kt ────────────────────────
 #
-# Root cause:
-#   In v13.2.1 the upstream removed all proto-generated sources and rewrote
-#   the listentogether/ package to use plain @Serializable Kotlin data classes.
-#   However, MessageCodec.kt was accidentally left with the old protobuf-based
-#   implementation that references the now-deleted outer class "Listentogether"
-#   and the "proto" import package.
+# The original file uses:
+#   com.google.protobuf.MessageLite
+#   com.metrolist.music.listentogether.proto.Listentogether
+#   Listentogether.Envelope.newBuilder() / .parseFrom()
+#   Listentogether.<Type>.newBuilder() / .parseFrom()
 #
-# Fix:
-#   Replace the file entirely with a correct implementation that uses
-#   kotlinx.serialization JSON — the same serialization library already used
-#   throughout the rest of the project. The public API surface (function names
-#   and parameter/return types) matches exactly what the other files expect.
+# All of these were removed in v13.2.1. This replacement uses
+# kotlinx.serialization JSON (already in the project) with optional
+# GZIP compression, keeping the identical public API.
 
-_MESSAGE_CODEC_SOURCE = textwrap.dedent("""\
-    package com.metrolist.music.listentogether
+_MESSAGE_CODEC_SOURCE = '''\
+/**
+ * Metrolist Project (C) 2026
+ * Licensed under GPL-3.0 | See git history for contributors
+ */
 
-    import kotlinx.serialization.encodeToString
-    import kotlinx.serialization.json.Json
-    import kotlinx.serialization.json.JsonElement
-    import kotlinx.serialization.json.decodeFromJsonElement
-    import kotlinx.serialization.json.encodeToJsonElement
-    import kotlinx.serialization.json.jsonObject
-    import kotlinx.serialization.json.jsonPrimitive
+package com.metrolist.music.listentogether
 
-    /**
-     * MessageCodec — encodes and decodes ListenTogether wire messages.
-     *
-     * Replaced the old protobuf-based implementation (Listentogether.Message /
-     * com.metrolist.music.listentogether.proto.*) which was removed in v13.2.1.
-     * Uses kotlinx.serialization JSON over UTF-8 ByteArray.
-     * Wire envelope: { "type": "...", "payload": { ... } }
-     */
-    object MessageCodec {
+import kotlinx.serialization.encodeToString
+import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonElement
+import kotlinx.serialization.json.buildJsonObject
+import kotlinx.serialization.json.decodeFromJsonElement
+import kotlinx.serialization.json.encodeToJsonElement
+import kotlinx.serialization.json.jsonObject
+import kotlinx.serialization.json.jsonPrimitive
+import kotlinx.serialization.json.put
+import timber.log.Timber
+import java.io.ByteArrayInputStream
+import java.io.ByteArrayOutputStream
+import java.util.zip.GZIPInputStream
+import java.util.zip.GZIPOutputStream
 
-        private val json = Json {
-            ignoreUnknownKeys = true
-            encodeDefaults = false
-            isLenient = true
+/**
+ * Codec for encoding and decoding messages.
+ *
+ * Replaces the old protobuf-based implementation removed in v13.2.1.
+ * Uses kotlinx.serialization JSON over UTF-8 ByteArray with optional GZIP
+ * compression. Public API is identical to the original class.
+ *
+ * Wire format: {"type":"<TYPE>","compressed":<bool>,"payload":"<JSON-string>"}
+ */
+class MessageCodec(
+    var compressionEnabled: Boolean = false
+) {
+    companion object {
+        private const val TAG = "MessageCodec"
+        private const val COMPRESSION_THRESHOLD = 100
+    }
+
+    private val json = Json {
+        ignoreUnknownKeys = true
+        encodeDefaults = false
+        isLenient = true
+    }
+
+    // ── Public API ────────────────────────────────────────────────────────────
+
+    fun encode(msgType: String, payload: Any?): ByteArray {
+        var payloadBytes = if (payload != null) {
+            json.encodeToString(toJsonElement(payload)).toByteArray(Charsets.UTF_8)
+        } else {
+            byteArrayOf()
         }
 
-        // ── Wire envelope ─────────────────────────────────────────────────
+        var compressed = false
+        if (compressionEnabled && payloadBytes.size > COMPRESSION_THRESHOLD) {
+            val compressedBytes = compressData(payloadBytes)
+            if (compressedBytes.size < payloadBytes.size) {
+                payloadBytes = compressedBytes
+                compressed = true
+            }
+        }
 
-        fun encode(type: String, payload: JsonElement): ByteArray =
-            json.encodeToString(
-                mapOf("type" to json.encodeToJsonElement(type), "payload" to payload)
-            ).toByteArray(Charsets.UTF_8)
-
-        fun decode(bytes: ByteArray): Pair<String, JsonElement>? = runCatching {
-            val root = json.parseToJsonElement(bytes.toString(Charsets.UTF_8)).jsonObject
-            val type = root["type"]?.jsonPrimitive?.content ?: return null
-            val payload = root["payload"] ?: return null
-            type to payload
-        }.getOrNull()
-
-        // ── Encode helpers ────────────────────────────────────────────────
-
-        fun encodePlaybackAction(payload: PlaybackActionPayload): ByteArray =
-            encode("PLAYBACK_ACTION", json.encodeToJsonElement(payload))
-
-        fun encodeSyncState(payload: SyncStatePayload): ByteArray =
-            encode("SYNC_STATE", json.encodeToJsonElement(payload))
-
-        fun encodeSuggestionRejected(payload: SuggestionRejectedPayload): ByteArray =
-            encode("SUGGESTION_REJECTED", json.encodeToJsonElement(payload))
-
-        fun encodeRoomState(state: RoomState): ByteArray =
-            encode("ROOM_STATE", json.encodeToJsonElement(state))
-
-        // ── Decode helpers ────────────────────────────────────────────────
-
-        fun decodePlaybackAction(bytes: ByteArray): PlaybackActionPayload? =
-            decodePayload(bytes)
-
-        fun decodeSyncState(bytes: ByteArray): SyncStatePayload? =
-            decodePayload(bytes)
-
-        fun decodeSuggestionRejected(bytes: ByteArray): SuggestionRejectedPayload? =
-            decodePayload(bytes)
-
-        fun decodeRoomState(bytes: ByteArray): RoomState? =
-            decodePayload(bytes)
-
-        // ── Conversion helpers ────────────────────────────────────────────
-
-        fun trackInfoToBytes(track: TrackInfo): ByteArray =
-            encode("TRACK_INFO", json.encodeToJsonElement(track))
-
-        fun trackInfoFromBytes(bytes: ByteArray): TrackInfo? =
-            decodePayload(bytes)
-
-        fun roomStateToBytes(state: RoomState): ByteArray =
-            encodeRoomState(state)
-
-        fun roomStateFromBytes(bytes: ByteArray): RoomState? =
-            decodeRoomState(bytes)
-
-        private inline fun <reified T> decodePayload(bytes: ByteArray): T? =
-            runCatching {
-                val (_, payload) = decode(bytes) ?: return null
-                json.decodeFromJsonElement<T>(payload)
-            }.getOrNull()
+        val envelope = buildJsonObject {
+            put("type", msgType)
+            put("compressed", compressed)
+            put("payload", if (payloadBytes.isEmpty()) "" else payloadBytes.toString(Charsets.UTF_8))
+        }
+        return json.encodeToString(envelope).toByteArray(Charsets.UTF_8)
     }
-""")
+
+    fun decode(data: ByteArray): Pair<String, ByteArray> {
+        val root = json.parseToJsonElement(data.toString(Charsets.UTF_8)).jsonObject
+        val msgType = root["type"]?.jsonPrimitive?.content ?: ""
+        val compressed = root["compressed"]?.jsonPrimitive?.content?.toBoolean() ?: false
+        val payloadStr = root["payload"]?.jsonPrimitive?.content ?: ""
+
+        var payloadBytes = payloadStr.toByteArray(Charsets.UTF_8)
+        if (compressed) {
+            payloadBytes = decompressData(payloadBytes) ?: payloadBytes
+        }
+        return Pair(msgType, payloadBytes)
+    }
+
+    fun decodePayload(msgType: String, payloadBytes: ByteArray): Any? {
+        if (payloadBytes.isEmpty()) return null
+        return try {
+            val element = json.parseToJsonElement(payloadBytes.toString(Charsets.UTF_8))
+            decodeJsonPayload(msgType, element)
+        } catch (e: Exception) {
+            Timber.tag(TAG).e(e, "Failed to decode payload for type: $msgType")
+            null
+        }
+    }
+
+    // ── Serialization helpers ─────────────────────────────────────────────────
+
+    private fun toJsonElement(payload: Any): JsonElement = when (payload) {
+        is CreateRoomPayload        -> json.encodeToJsonElement(payload)
+        is JoinRoomPayload          -> json.encodeToJsonElement(payload)
+        is ApproveJoinPayload       -> json.encodeToJsonElement(payload)
+        is RejectJoinPayload        -> json.encodeToJsonElement(payload)
+        is PlaybackActionPayload    -> json.encodeToJsonElement(payload)
+        is BufferReadyPayload       -> json.encodeToJsonElement(payload)
+        is KickUserPayload          -> json.encodeToJsonElement(payload)
+        is TransferHostPayload      -> json.encodeToJsonElement(payload)
+        is ChatPayload              -> json.encodeToJsonElement(payload)
+        is SuggestTrackPayload      -> json.encodeToJsonElement(payload)
+        is ApproveSuggestionPayload -> json.encodeToJsonElement(payload)
+        is RejectSuggestionPayload  -> json.encodeToJsonElement(payload)
+        is ReconnectPayload         -> json.encodeToJsonElement(payload)
+        else -> throw IllegalArgumentException("Unsupported payload type: ${payload::class.simpleName}")
+    }
+
+    private fun decodeJsonPayload(msgType: String, element: JsonElement): Any? = when (msgType) {
+        MessageTypes.ROOM_CREATED        -> json.decodeFromJsonElement<RoomCreatedPayload>(element)
+        MessageTypes.JOIN_REQUEST        -> json.decodeFromJsonElement<JoinRequestPayload>(element)
+        MessageTypes.JOIN_APPROVED       -> json.decodeFromJsonElement<JoinApprovedPayload>(element)
+        MessageTypes.JOIN_REJECTED       -> json.decodeFromJsonElement<JoinRejectedPayload>(element)
+        MessageTypes.USER_JOINED         -> json.decodeFromJsonElement<UserJoinedPayload>(element)
+        MessageTypes.USER_LEFT           -> json.decodeFromJsonElement<UserLeftPayload>(element)
+        MessageTypes.SYNC_PLAYBACK       -> json.decodeFromJsonElement<PlaybackActionPayload>(element)
+        MessageTypes.BUFFER_WAIT         -> json.decodeFromJsonElement<BufferWaitPayload>(element)
+        MessageTypes.BUFFER_COMPLETE     -> json.decodeFromJsonElement<BufferCompletePayload>(element)
+        MessageTypes.ERROR               -> json.decodeFromJsonElement<ErrorPayload>(element)
+        MessageTypes.HOST_CHANGED        -> json.decodeFromJsonElement<HostChangedPayload>(element)
+        MessageTypes.KICKED              -> json.decodeFromJsonElement<KickedPayload>(element)
+        MessageTypes.SYNC_STATE          -> json.decodeFromJsonElement<SyncStatePayload>(element)
+        MessageTypes.RECONNECTED         -> json.decodeFromJsonElement<ReconnectedPayload>(element)
+        MessageTypes.USER_RECONNECTED    -> json.decodeFromJsonElement<UserReconnectedPayload>(element)
+        MessageTypes.USER_DISCONNECTED   -> json.decodeFromJsonElement<UserDisconnectedPayload>(element)
+        MessageTypes.SUGGESTION_RECEIVED -> json.decodeFromJsonElement<SuggestionReceivedPayload>(element)
+        MessageTypes.SUGGESTION_APPROVED -> json.decodeFromJsonElement<SuggestionApprovedPayload>(element)
+        MessageTypes.SUGGESTION_REJECTED -> json.decodeFromJsonElement<SuggestionRejectedPayload>(element)
+        else -> null
+    }
+
+    // ── Compression ───────────────────────────────────────────────────────────
+
+    private fun compressData(data: ByteArray): ByteArray {
+        val out = ByteArrayOutputStream()
+        GZIPOutputStream(out).use { it.write(data) }
+        return out.toByteArray()
+    }
+
+    private fun decompressData(data: ByteArray): ByteArray? = try {
+        GZIPInputStream(ByteArrayInputStream(data)).use { it.readBytes() }
+    } catch (e: Exception) {
+        Timber.tag(TAG).e(e, "Failed to decompress data")
+        null
+    }
+}
+'''
 
 
 def replace_message_codec() -> None:
-    """
-    Overwrite MessageCodec.kt with a kotlinx.serialization-based implementation.
-
-    The upstream file at v13.2.1 references:
-      - import com.metrolist.music.listentogether.proto.*  (package deleted)
-      - Listentogether.Message / Listentogether.PlaybackAction etc. (class deleted)
-      - Proto builder/parser methods (parseFrom, newBuilder, build, etc.)
-      - Proto field accessors with legacy names (usersList, queueList, userId, etc.)
-
-    None of these exist in v13.2.1; the replacement uses the Kotlin data classes
-    that are already correctly defined in the other listentogether/ source files.
-    """
+    log(f"Replacing {MESSAGE_CODEC_PATH}...")
     if not os.path.exists(MESSAGE_CODEC_PATH):
-        log(f"  WARNING: {MESSAGE_CODEC_PATH} not found — skipping replacement.")
-        log("  (This is unexpected; the build may have other issues.)")
+        log(f"  WARNING: {MESSAGE_CODEC_PATH} not found — skipping.")
         return
 
-    # Verify the file actually needs replacing (contains the broken proto import)
     existing = open(MESSAGE_CODEC_PATH, "r", encoding="utf-8").read()
-    if "listentogether.proto" in existing or "Listentogether" in existing:
+
+    if "listentogether.proto" in existing or "Listentogether" in existing or "MessageLite" in existing:
         open(MESSAGE_CODEC_PATH, "w", encoding="utf-8").write(_MESSAGE_CODEC_SOURCE)
-        log(f"  Replaced broken proto-based {MESSAGE_CODEC_PATH} with")
-        log("  kotlinx.serialization JSON implementation.")
-    elif "MessageCodec" in existing and "kotlinx.serialization" in existing:
-        log(f"  {MESSAGE_CODEC_PATH} already uses kotlinx.serialization — no change.")
+        log("  Replaced proto-based MessageCodec.kt with kotlinx.serialization implementation.")
+    elif "kotlinx.serialization" in existing:
+        log("  MessageCodec.kt already uses kotlinx.serialization — no change needed.")
     else:
-        # File exists but doesn't match either pattern — replace to be safe
         open(MESSAGE_CODEC_PATH, "w", encoding="utf-8").write(_MESSAGE_CODEC_SOURCE)
-        log(f"  Replaced unrecognised {MESSAGE_CODEC_PATH} with")
-        log("  kotlinx.serialization JSON implementation.")
+        log("  Replaced unrecognised MessageCodec.kt with kotlinx.serialization implementation.")
 
 
 # ── Main ──────────────────────────────────────────────────────
