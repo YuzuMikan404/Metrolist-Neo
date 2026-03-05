@@ -290,25 +290,42 @@ def write_app_name(name: str) -> None:
 
 
 # ── 6. build.gradle.kts ───────────────────────────────────────
-# Plugin patterns that MUST be disabled (no GMS/Firebase at build time).
-# Protobuf is intentionally absent — disabling it breaks code generation.
-_DISABLE_PLUGIN_PATTERNS = [
+#
+# Plugin handling strategy
+# ────────────────────────
+# google-services / firebase  →  add "apply false" (keeps plugin in registry,
+#                                  prevents runtime crash without secrets)
+# protobuf                    →  REMOVE "apply false" if present
+#                                  (upstream sometimes ships protobuf as
+#                                   apply false; without active protobuf the
+#                                   generateProto task never appears and
+#                                   MessageCodec.kt fails to compile)
+#
+# We never use comment-out (//) for plugin lines because that removes the
+# plugin from the registry entirely, which can break dependency resolution
+# for sibling plugins.
+
+# Lines that get " apply false" appended (if not already disabled).
+_GMS_PATTERNS = [
     r'alias\s*\(\s*libs\.plugins\.google\.services\s*\)',
-    r'id\s*\(\s*"com\.google\.gms\.google-services"\s*\)',
+    r'id\s*\(\s*["\']com\.google\.gms\.google-services["\']\s*\)',
     r'alias\s*\(\s*libs\.plugins\.firebase\.crashlytics\s*\)',
     r'alias\s*\(\s*libs\.plugins\.firebase\.perf\s*\)',
-    r'id\s*\(\s*"com\.google\.firebase\.[^"]+"\s*\)',
+    r'id\s*\(\s*["\']com\.google\.firebase\.[^"\']+["\']\s*\)',
+]
+
+# Lines where "apply false" must be REMOVED so the plugin becomes active.
+_MUST_ENABLE_PATTERNS = [
+    r'protobuf',   # any line referencing protobuf in plugins{} block
 ]
 
 
 def patch_build_gradle() -> None:
     """
-    1. Replace applicationId with APP_ID.
-    2. Comment out google-services / firebase plugin lines.
-       - Already-commented (//) or apply(false) lines are left untouched.
-       - protobuf plugin lines are NEVER touched.
-    Note: resValue() is never injected here because buildFeatures.resValues
-          may be disabled upstream (causes EvalIssueException if injected).
+    1. Dump plugins{} block for diagnostics.
+    2. Replace applicationId with APP_ID.
+    3. Ensure protobuf plugin is ACTIVE (remove 'apply false' if present).
+    4. Add 'apply false' to google-services / firebase lines.
     """
     log(f"Patching {GRADLE_FILE}...")
     if not os.path.exists(GRADLE_FILE):
@@ -317,31 +334,72 @@ def patch_build_gradle() -> None:
     txt = open(GRADLE_FILE, "r").read()
     original = txt
 
-    # 1. applicationId
+    # ── Diagnostics: dump plugins{} block ───────────────────────
+    plugins_m = re.search(r'plugins\s*\{([^}]*)\}', txt, re.DOTALL)
+    if plugins_m:
+        log("  plugins{} block found:")
+        for l in plugins_m.group(1).splitlines():
+            if l.strip():
+                log(f"    {l.strip()}")
+    else:
+        log("  WARNING: no plugins{} block found in build.gradle.kts")
+
+    # ── 1. applicationId ────────────────────────────────────────
     txt = re.sub(
         r'(applicationId\s*=\s*)"[^"]*"',
         r'\g<1>"' + APP_ID + '"',
         txt,
     )
 
-    # 2. Disable GMS / Firebase plugins line-by-line
+    # ── Process plugins{} block line by line ────────────────────
+    in_plugins_block = False
+    brace_depth = 0
     lines, out = txt.splitlines(keepends=True), []
+
     for line in lines:
         stripped = line.lstrip()
-        if stripped.startswith("//"):            # already commented
-            out.append(line); continue
-        if re.search(r'apply\s*\(\s*false\s*\)', line):  # already disabled
-            out.append(line); continue
-        matched = False
-        for pat in _DISABLE_PLUGIN_PATTERNS:
-            if re.search(pat, line):
-                indent = len(line) - len(stripped)
-                out.append(" " * indent + "// " + stripped)
-                log(f"  Disabled plugin: {line.strip()}")
-                matched = True
-                break
-        if not matched:
+
+        # Track entry/exit of plugins{} block
+        if re.match(r'plugins\s*\{', stripped):
+            in_plugins_block = True
+            brace_depth = 1
             out.append(line)
+            continue
+        if in_plugins_block:
+            brace_depth += line.count("{") - line.count("}")
+            if brace_depth <= 0:
+                in_plugins_block = False
+                out.append(line)
+                continue
+
+            # ── 2. Ensure protobuf is ACTIVE ──────────────────
+            if any(re.search(p, line) for p in _MUST_ENABLE_PATTERNS):
+                if re.search(r'\bapply\s+false\b', line):
+                    # Strip " apply false" to activate the plugin
+                    fixed = re.sub(r'\s*apply\s+false', '', line)
+                    out.append(fixed)
+                    log(f"  Enabled protobuf plugin: {line.strip()} → {fixed.strip()}")
+                else:
+                    out.append(line)
+                    log(f"  protobuf already active: {line.strip()}")
+                continue
+
+            # ── 3. Disable GMS/Firebase with apply false ──────
+            if not stripped.startswith("//") and not re.search(r'\bapply\s+false\b', line):
+                for pat in _GMS_PATTERNS:
+                    if re.search(pat, line):
+                        new_line = line.rstrip("\n").rstrip() + " apply false\n"
+                        out.append(new_line)
+                        log(f"  apply false → {line.strip()}")
+                        break
+                else:
+                    out.append(line)
+            else:
+                out.append(line)
+            continue
+
+        out.append(line)
+
     txt = "".join(out)
 
     if txt != original:
