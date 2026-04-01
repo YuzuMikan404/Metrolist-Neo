@@ -50,6 +50,18 @@ def die(msg):
     print(f"[modify.py] ERROR: {msg}", file=sys.stderr, flush=True)
     sys.exit(1)
 
+def read_file(path, encoding="utf-8"):
+    try:
+        return open(path, encoding=encoding).read()
+    except OSError as e:
+        die(f"Cannot read {path}: {e}")
+
+def write_file(path, content, encoding="utf-8"):
+    try:
+        open(path, "w", encoding=encoding).write(content)
+    except OSError as e:
+        die(f"Cannot write {path}: {e}")
+
 
 # ── 1. アイコン色変更 ─────────────────────────────────────────
 # 元の XML ベクターアイコンをそのまま使い、色だけ書き換える。
@@ -80,40 +92,113 @@ def patch_icon_colors():
                 "drawable-v31/ic_launcher_background_v31.xml"):
         path = os.path.join(RES_DIR, rel)
         if os.path.exists(path):
-            open(path, "w", encoding="utf-8").write(bg_gradient_xml)
+            write_file(path, bg_gradient_xml)
             log(f"  Updated: {rel}")
+        else:
+            log(f"  Skipped (not found): {rel}")
 
     bg_color_path = os.path.join(RES_DIR, "values/ic_launcher_background.xml")
     if os.path.exists(bg_color_path):
-        txt = open(bg_color_path, encoding="utf-8").read()
-        txt = re.sub(r'<color name="ic_launcher_background">[^<]*</color>',
+        txt = read_file(bg_color_path)
+        new = re.sub(r'<color name="ic_launcher_background">[^<]*</color>',
                      f'<color name="ic_launcher_background">{ICON_BG_START}</color>', txt)
-        open(bg_color_path, "w", encoding="utf-8").write(txt)
-        log("  Updated: values/ic_launcher_background.xml")
+        if new != txt:
+            write_file(bg_color_path, new)
+            log("  Updated: values/ic_launcher_background.xml")
+        else:
+            log("  Warning: ic_launcher_background color pattern not found, skipped.")
+    else:
+        log("  Skipped (not found): values/ic_launcher_background.xml")
 
     for rel in ("drawable/ic_launcher_foreground.xml",
                 "drawable/ic_launcher_foreground_v31.xml"):
         path = os.path.join(RES_DIR, rel)
         if os.path.exists(path):
-            txt = open(path, encoding="utf-8").read()
-            txt = re.sub(r'android:strokeColor="[^"]*"',
+            txt = read_file(path)
+            new = re.sub(r'android:strokeColor="[^"]*"',
                          f'android:strokeColor="{ICON_FG_COLOR}"', txt)
-            open(path, "w", encoding="utf-8").write(txt)
-            log(f"  Updated: {rel}")
+            if new != txt:
+                write_file(path, new)
+                log(f"  Updated: {rel}")
+            else:
+                log(f"  Warning: strokeColor pattern not found in {rel}, skipped.")
+        else:
+            log(f"  Skipped (not found): {rel}")
 
 
 # ── 2. applicationId ─────────────────────────────────────────
+#
+# v13.4.0 で build.gradle.kts の構造が変わった:
+#
+#   旧（〜v13.3.x）:
+#     applicationId = "com.metrolist.music"
+#
+#   新（v13.4.0+）:
+#     val baseApplicationId = "com.metrolist.music"
+#     val applicationIdOverride = System.getenv("METROLIST_APPLICATION_ID")?.takeIf { it.isNotBlank() }
+#     ...
+#     applicationId = applicationIdOverride ?: baseApplicationId
+#
+# 旧パターンは `applicationId = "..."` の文字列リテラルを直接置換できたが、
+# 新パターンでは `applicationId` の右辺が変数式になっているため正規表現がマッチしない。
+# → "applicationId unchanged (already correct?)" と誤判定してスキップされていた。
+#
+# 修正方針:
+#   1. まず新パターン（baseApplicationId 変数）を試みる
+#   2. 見つからなければ旧パターン（applicationId = "..." 直接代入）を試みる
+#   3. namespace も同一 package を指している場合は合わせて書き換える
+#   4. どちらも見つからなければ WARNING を出し、手動確認を促す（die しない）
+
 def patch_application_id():
     log(f"Patching applicationId → {APP_ID}...")
     if not os.path.exists(GRADLE_FILE):
         die(f"Not found: {GRADLE_FILE}")
-    txt = open(GRADLE_FILE).read()
-    new = re.sub(r'(applicationId\s*=\s*)"[^"]*"', rf'\1"{APP_ID}"', txt)
+
+    txt = read_file(GRADLE_FILE)
+    new = txt
+    patched = False
+
+    # パターン1: v13.4.0+ — val baseApplicationId = "..."
+    new, n = re.subn(
+        r'(val\s+baseApplicationId\s*=\s*)"[^"]*"',
+        rf'\1"{APP_ID}"',
+        new,
+    )
+    if n:
+        log(f"  baseApplicationId patched ({n} occurrence(s)).")
+        patched = True
+
+    # パターン2: 旧スタイル — applicationId = "..." (直接文字列リテラル)
+    # ただし applicationIdOverride や applicationIdSuffix は触らない
+    new, n = re.subn(
+        r'(?<!\w)(applicationId\s*=\s*)"[^"]*"',
+        rf'\1"{APP_ID}"',
+        new,
+    )
+    if n:
+        log(f"  applicationId (literal) patched ({n} occurrence(s)).")
+        patched = True
+
+    # パターン3: namespace も元パッケージを指していれば合わせて書き換える
+    # ※ namespace はビルド上の R クラス生成に使うだけで applicationId とは独立だが、
+    #    fork 運用では一致させておく方が混乱が少ない。不要なら削除してよい。
+    new, n = re.subn(
+        r'(namespace\s*=\s*)"com\.metrolist\.music"',
+        rf'\1"{APP_ID}"',
+        new,
+    )
+    if n:
+        log(f"  namespace patched ({n} occurrence(s)).")
+
+    if not patched:
+        log("  WARNING: applicationId pattern not found. Manual check needed.")
+        log(f"    File: {GRADLE_FILE}")
+        return  # die せず続行（他のパッチは適用する）
+
     if new != txt:
-        open(GRADLE_FILE, "w").write(new)
-        log("  applicationId patched.")
+        write_file(GRADLE_FILE, new)
     else:
-        log("  applicationId unchanged (already correct?).")
+        log("  applicationId already set to the target value — no change needed.")
 
 
 # ── 3. アプリ名 ───────────────────────────────────────────────
@@ -131,7 +216,7 @@ def write_app_name():
                 continue
             fp = os.path.join(root, fname)
             try:
-                txt = open(fp, encoding="utf-8").read()
+                txt = read_file(fp)
                 if 'name="app_name"' not in txt:
                     continue
                 cleaned = pattern.sub("", txt)
@@ -140,7 +225,7 @@ def write_app_name():
                     os.remove(fp)
                     log(f"  Removed empty: {fp}")
                 else:
-                    open(fp, "w", encoding="utf-8").write(cleaned)
+                    write_file(fp, cleaned)
                     log(f"  Cleaned: {fp}")
             except Exception as exc:
                 log(f"  Warning: {fp}: {exc}")
@@ -149,14 +234,14 @@ def write_app_name():
     os.makedirs(os.path.join(RES_DIR, "values"), exist_ok=True)
     sp = os.path.join(RES_DIR, "values", "strings.xml")
     if os.path.exists(sp):
-        txt = open(sp, encoding="utf-8").read()
+        txt = read_file(sp)
         if 'name="app_name"' in txt:
             txt = re.sub(r'<string\s+name="app_name"[^>]*>[^<]*</string>', entry, txt)
         else:
             txt = re.sub(r"(<resources[^>]*>)", rf"\1\n    {entry}", txt, count=1)
-        open(sp, "w", encoding="utf-8").write(txt)
+        write_file(sp, txt)
     else:
-        open(sp, "w", encoding="utf-8").write(
+        write_file(sp,
             f'<?xml version="1.0" encoding="utf-8"?>\n<resources>\n    {entry}\n</resources>'
         )
     log(f"  app_name written to {sp}")
@@ -167,21 +252,22 @@ def patch_manifest():
     log(f"Patching {MANIFEST_FILE}...")
     if not os.path.exists(MANIFEST_FILE):
         die(f"Not found: {MANIFEST_FILE}")
-    txt = open(MANIFEST_FILE).read()
+    txt = read_file(MANIFEST_FILE)
     txt = re.sub(r'android:label="[^"]*"',  'android:label="@string/app_name"', txt)
     txt = re.sub(r'android:icon="[^"]*"',   'android:icon="@mipmap/ic_launcher"', txt)
     if "android:roundIcon=" in txt:
         txt = re.sub(r'android:roundIcon="[^"]*"', 'android:roundIcon="@mipmap/ic_launcher_round"', txt)
     else:
         txt = txt.replace("<application", '<application android:roundIcon="@mipmap/ic_launcher_round"', 1)
-    open(MANIFEST_FILE, "w").write(txt)
+    write_file(MANIFEST_FILE, txt)
+    log("  AndroidManifest patched.")
 
 
 # ── 5. MessageCodec.kt の修正 ─────────────────────────────────
 #
 # 問題: v13.2.1 で upstream が listentogether/ パッケージを
 #       protobuf → kotlinx.serialization に書き直したが、
-#       MessageCodec.kt だけ旧 proto API のまま残ってしまった。
+#       MessageCodec.kt だけ旧 proto API のままになっていた。
 #
 # 修正: 公開 API（クラス名・メソッドシグネチャ）を完全に維持したまま
 #       kotlinx.serialization JSON + GZIP 圧縮で再実装する。
@@ -330,9 +416,9 @@ def replace_message_codec():
     if not os.path.exists(MESSAGE_CODEC_PATH):
         log("  Not found — skipping.")
         return
-    existing = open(MESSAGE_CODEC_PATH, encoding="utf-8").read()
+    existing = read_file(MESSAGE_CODEC_PATH)
     if "Listentogether" in existing or "listentogether.proto" in existing:
-        open(MESSAGE_CODEC_PATH, "w", encoding="utf-8").write(_MESSAGE_CODEC_SOURCE)
+        write_file(MESSAGE_CODEC_PATH, _MESSAGE_CODEC_SOURCE)
         log("  Replaced (was proto-based).")
     else:
         log("  Already up to date — no change.")
