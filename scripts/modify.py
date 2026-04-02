@@ -2,18 +2,25 @@
 """
 scripts/modify.py  —  Metrolist Neo build patcher
 
+【設計方針】
+  Android では namespace と applicationId は独立した設定。
+    - namespace    = Rクラス・BuildConfigのJavaパッケージ名
+                     → com.metrolist.music のまま維持
+                     → ソースコード全体がこのパッケージで R/BuildConfig を参照している
+    - applicationId = APKのアプリ識別子（インストール時・Play Storeで使われる）
+                     → com.metrolist.clone に変更
+
+  namespace を変えようとしたことが過去のエラーの根本原因だった。
+  applicationId だけ変更すれば R/BuildConfig の import は一切触る必要がない。
+
 やること:
-  1. アイコン色変更（ベクターXML書き換え）
-  2. applicationId と namespace を APP_ID (com.metrolist.clone) に変更
-  3. ソースコード全体の import を com.metrolist.music.R / BuildConfig
-     → com.metrolist.clone.R / BuildConfig に書き換え
-     （namespace を clone にした場合、Gradle が生成する R/BuildConfig の
-       パッケージが clone になるため、ソース側も合わせる必要がある）
-  4. アプリ名を APP_NAME に変更
-  5. AndroidManifest の label/icon を更新
-  6. MessageCodec.kt を修正（proto API → kotlinx.serialization）
-  7. gradle.properties に CI 用 JVM 設定をマージ
-  8. build.gradle.kts の buildFeatures.buildConfig = true を保証
+  1. アイコン色変更
+  2. applicationId を com.metrolist.clone に変更（namespace は触らない）
+  3. アプリ名を Metrolist Neo に変更
+  4. AndroidManifest の label/icon を更新
+  5. MessageCodec.kt を修正（proto API → kotlinx.serialization）
+  6. gradle.properties に CI 用 JVM 設定をマージ
+  7. buildFeatures.buildConfig = true を保証
 """
 
 import os
@@ -22,13 +29,12 @@ import sys
 from pathlib import Path
 
 # ── CONFIG ────────────────────────────────────────────────────
-APP_NAME = "Metrolist Neo"
-APP_ID   = "com.metrolist.clone"
+APP_NAME       = "Metrolist Neo"
+APPLICATION_ID = "com.metrolist.clone"   # APK識別子のみ変更
 
-# upstream ソースの元パッケージ（書き換え元）
-UPSTREAM_PKG = "com.metrolist.music"
+# namespace = "com.metrolist.music" は変更しない
+# （R/BuildConfig のパッケージに使われるため、ソースと一致させる必要がある）
 
-# アイコンの色設定
 ICON_BG_START  = "#0055AA"
 ICON_BG_END    = "#00ACEE"
 ICON_FG_COLOR  = "#FFFFFFFF"
@@ -37,13 +43,6 @@ BASE_DIR      = "app"
 RES_DIR       = os.path.join(BASE_DIR, "src/main/res")
 GRADLE_FILE   = os.path.join(BASE_DIR, "build.gradle.kts")
 MANIFEST_FILE = os.path.join(BASE_DIR, "src/main/AndroidManifest.xml")
-
-# ソースルート（import 書き換え対象のディレクトリ）
-SRC_ROOTS = [
-    os.path.join(BASE_DIR, "src/main/kotlin"),
-    os.path.join(BASE_DIR, "src/gms/kotlin"),
-    os.path.join(BASE_DIR, "src/foss/kotlin"),
-]
 
 MESSAGE_CODEC_PATH = os.path.join(
     BASE_DIR,
@@ -136,16 +135,16 @@ def patch_icon_colors():
             log(f"  Skipped (not found): {rel}")
 
 
-# ── 2. applicationId と namespace を APP_ID に変更 ────────────
+# ── 2. applicationId のみ変更（namespace は絶対に触らない） ──
 #
-# namespace を APP_ID に変更することで、Gradle が生成する
-# R クラスと BuildConfig のパッケージが com.metrolist.clone になる。
-# この後のステップ3でソースコード側の import も合わせて書き換える。
+# Android の正規設計:
+#   namespace    = Rクラス・BuildConfig の Java パッケージ → ソースと一致させる
+#   applicationId = APK の識別子 → 自由に変更可能
 #
 # v13.4.0+ パターン: val baseApplicationId = "..."
 # 旧パターン:        applicationId = "..." (文字列リテラル)
 def patch_application_id():
-    log(f"Patching applicationId + namespace → {APP_ID}...")
+    log(f"Patching applicationId → {APPLICATION_ID} (namespace unchanged)...")
     if not os.path.exists(GRADLE_FILE):
         die(f"Not found: {GRADLE_FILE}")
 
@@ -156,135 +155,38 @@ def patch_application_id():
     # パターン1: v13.4.0+ — val baseApplicationId = "..."
     new, n = re.subn(
         r'(val\s+baseApplicationId\s*=\s*)"[^"]*"',
-        rf'\1"{APP_ID}"',
+        rf'\1"{APPLICATION_ID}"',
         new,
     )
     if n:
         log(f"  baseApplicationId patched ({n} occurrence(s)).")
         patched = True
 
-    # パターン2: 旧スタイル — applicationId = "..." (文字列リテラル直接代入)
+    # パターン2: 旧スタイル直接代入 — applicationId = "..."
     # applicationIdSuffix / applicationIdOverride は除外
     new, n = re.subn(
         r'(?<!\w)(applicationId\s*=\s*)"[^"]*"',
-        rf'\1"{APP_ID}"',
+        rf'\1"{APPLICATION_ID}"',
         new,
     )
     if n:
         log(f"  applicationId (literal) patched ({n} occurrence(s)).")
         patched = True
 
-    # パターン3: namespace も書き換える
-    # namespace を APP_ID にすることで R/BuildConfig が com.metrolist.clone.* になる
-    new, n = re.subn(
-        r'(namespace\s*=\s*)"[^"]*"',
-        rf'\1"{APP_ID}"',
-        new,
-    )
-    if n:
-        log(f"  namespace patched to {APP_ID} ({n} occurrence(s)).")
+    # namespace は触らない ← ここが過去の失敗の根本原因
 
     if not patched:
         log("  WARNING: applicationId pattern not found. Manual check needed.")
-        log(f"    File: {GRADLE_FILE}")
         return
 
     if new != txt:
         write_file(GRADLE_FILE, new)
         log("  build.gradle.kts written.")
     else:
-        log("  applicationId/namespace already set — no change needed.")
+        log("  applicationId already correct — no change.")
 
 
-# ── 3. ソースコード全体の import 書き換え ────────────────────
-#
-# namespace = com.metrolist.clone にすると、Gradle が生成する
-# R クラスと BuildConfig のパッケージが com.metrolist.clone になる。
-# ソースコードは元々 com.metrolist.music.R / BuildConfig を
-# import しているので、これを com.metrolist.clone.R / BuildConfig に変更する。
-#
-# 対象: import com.metrolist.music.R
-#        import com.metrolist.music.BuildConfig
-#
-# ※ package 宣言 (package com.metrolist.music) はそのままでよい。
-#   クラス自体のパッケージは変えず、生成クラスへの参照だけ変える。
-def patch_source_imports():
-    log(f"Patching source imports: {UPSTREAM_PKG}.R/BuildConfig → {APP_ID}.R/BuildConfig ...")
-
-    # ── パターン定義 ──────────────────────────────────────────
-    # (既存 import の書き換えパターン, 使用検出パターン, 追加する import 文)
-    targets = [
-        {
-            "rewrite":  re.compile(rf'import\s+{re.escape(UPSTREAM_PKG)}\.R\b'),
-            "replace":  f'import {APP_ID}.R',
-            # R.string.xxx / R.drawable.xxx / R.id.xxx 等の使用を検出
-            "use_pat":  re.compile(r'\bR\.(?:string|drawable|id|layout|mipmap|color|dimen|attr|style|anim|array|bool|integer|menu|raw|xml|font|plurals)\b'),
-            "import":   f'import {APP_ID}.R',
-        },
-        {
-            "rewrite":  re.compile(rf'import\s+{re.escape(UPSTREAM_PKG)}\.BuildConfig\b'),
-            "replace":  f'import {APP_ID}.BuildConfig',
-            "use_pat":  re.compile(r'\bBuildConfig\.'),
-            "import":   f'import {APP_ID}.BuildConfig',
-        },
-    ]
-
-    total_rewrites = 0
-    total_injections = 0
-    total_files = 0
-
-    for src_root in SRC_ROOTS:
-        if not os.path.isdir(src_root):
-            log(f"  Skipped (not found): {src_root}")
-            continue
-
-        for kt_file in Path(src_root).rglob("*.kt"):
-            txt = read_file(str(kt_file))
-            new = txt
-            changed = False
-
-            for t in targets:
-                # Step1: 既存 import を書き換え
-                replaced, n = t["rewrite"].subn(t["replace"], new)
-                if n:
-                    new = replaced
-                    changed = True
-                    total_rewrites += n
-                    continue  # import を書き換えたので追加不要
-
-                # Step2: import がないが実際に使用しているファイルへ注入
-                already_imported = t["replace"] in new
-                if already_imported:
-                    continue
-                if not t["use_pat"].search(new):
-                    continue
-
-                # package 宣言の直後に import を挿入
-                injected, m = re.subn(
-                    r'(^package\s+\S+\s*\n)',
-                    rf'\1\n{t["import"]}\n',
-                    new,
-                    count=1,
-                    flags=re.MULTILINE,
-                )
-                if m:
-                    new = injected
-                    changed = True
-                    total_injections += 1
-
-            if changed:
-                write_file(str(kt_file), new)
-                total_files += 1
-
-    log(f"  Done: {total_rewrites} import(s) rewritten, "
-        f"{total_injections} import(s) injected, "
-        f"in {total_files} file(s) total.")
-
-
-# ── 4. buildConfig = true を保証 ─────────────────────────────
-#
-# BuildConfig クラスの生成には buildFeatures { buildConfig = true } が必要。
-# AGP 8.0 以降はデフォルト無効。
+# ── 3. buildConfig = true を保証 ─────────────────────────────
 def ensure_build_config_enabled():
     log("Ensuring buildFeatures.buildConfig = true...")
     if not os.path.exists(GRADLE_FILE):
@@ -321,7 +223,7 @@ def ensure_build_config_enabled():
         log("  WARNING: Could not inject buildFeatures block. Manual check needed.")
 
 
-# ── 5. アプリ名 ───────────────────────────────────────────────
+# ── 4. アプリ名 ───────────────────────────────────────────────
 def write_app_name():
     log(f"Writing app_name: {APP_NAME!r}...")
     pattern = re.compile(r'\s*<string\s+name="app_name"[^>]*>[^<]*</string>', re.MULTILINE)
@@ -366,7 +268,7 @@ def write_app_name():
     log(f"  app_name written to {sp}")
 
 
-# ── 6. AndroidManifest ────────────────────────────────────────
+# ── 5. AndroidManifest ────────────────────────────────────────
 def patch_manifest():
     log(f"Patching {MANIFEST_FILE}...")
     if not os.path.exists(MANIFEST_FILE):
@@ -390,7 +292,7 @@ def patch_manifest():
     log("  AndroidManifest patched.")
 
 
-# ── 7. MessageCodec.kt の修正 ─────────────────────────────────
+# ── 6. MessageCodec.kt の修正 ─────────────────────────────────
 _MESSAGE_CODEC_SOURCE = '''\
 /**
  * Metrolist Project (C) 2026
@@ -416,7 +318,6 @@ import java.util.zip.GZIPOutputStream
 
 /**
  * Codec for encoding and decoding ListenTogether wire messages.
- *
  * Wire format: {"type":"<TYPE>","compressed":<bool>,"payload":"<JSON>"}
  */
 class MessageCodec(
@@ -540,7 +441,7 @@ def replace_message_codec():
         log("  Already up to date — no change.")
 
 
-# ── 8. gradle.properties ─────────────────────────────────────
+# ── 7. gradle.properties ─────────────────────────────────────
 def patch_gradle_properties():
     log("Patching gradle.properties...")
     desired = {
@@ -577,9 +478,8 @@ def patch_gradle_properties():
 if __name__ == "__main__":
     try:
         patch_icon_colors()
-        patch_application_id()
+        patch_application_id()       # applicationId のみ変更、namespace は触らない
         ensure_build_config_enabled()
-        patch_source_imports()   # ← namespace=clone に合わせて import を書き換える
         write_app_name()
         patch_manifest()
         replace_message_codec()
