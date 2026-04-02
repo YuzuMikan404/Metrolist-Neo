@@ -521,8 +521,6 @@ def patch_gradle_properties():
         "org.gradle.parallel":    "true",
         "org.gradle.caching":     "true",
         "android.enableJetifier": "false",
-        # AGP 8.0+ で BuildConfig 生成を明示的に有効化
-        "android.defaults.buildfeatures.buildconfig": "true",
     }
     path = "gradle.properties"
     lines = open(path).readlines() if os.path.exists(path) else []
