@@ -14,7 +14,7 @@ jobs:
     timeout-minutes: 90
 
     steps:
-      # ── 1. Checkout (this repo — contains our scripts) ────────
+      # ── 1. Checkout ───────────────────────────────────────────
       - name: Checkout
         uses: actions/checkout@v4
         with:
@@ -52,25 +52,32 @@ jobs:
         if: steps.check.outputs.trigger == 'true'
         run: bash scripts/fetch-source.sh "${{ steps.check.outputs.tag }}"
 
-      # ── 5. Patch source (Python — no shell escaping issues) ───
+      # ── 5. Patch source ───────────────────────────────────────
       - name: Apply Modifications
         if: steps.check.outputs.trigger == 'true'
         run: python3 scripts/modify.py
 
       # ── 6. Build ──────────────────────────────────────────────
+      # LASTFM キーは secrets から取得する。
+      # secrets が未設定の場合はダミー値にフォールバックし、
+      # LastFM 機能が無効化された状態でビルドが通る。
       - name: Build APK
         if: steps.check.outputs.trigger == 'true'
         env:
-          GITHUB_EVENT_NAME: pull_request
-          LASTFM_API_KEY: "dummy"
-          LASTFM_SECRET: "dummy"
-        run: bash scripts/build.sh
+          LASTFM_API_KEY: ${{ secrets.LASTFM_API_KEY }}
+          LASTFM_SECRET:  ${{ secrets.LASTFM_SECRET }}
+        run: |
+          : "${LASTFM_API_KEY:=dummy_key}"
+          : "${LASTFM_SECRET:=dummy_secret}"
+          export LASTFM_API_KEY LASTFM_SECRET
+          bash scripts/build.sh
 
-      # ── 7. Sign ───────────────────────────────────────────────
+      # ── 7. Collect ────────────────────────────────────────────
       - name: Collect APKs
         if: steps.check.outputs.trigger == 'true'
         run: bash scripts/collect-apks.sh
 
+      # ── 8. Sign ───────────────────────────────────────────────
       - name: Sign APK
         if: steps.check.outputs.trigger == 'true'
         uses: ilharp/sign-android-release@v1
@@ -87,7 +94,7 @@ jobs:
         if: steps.check.outputs.trigger == 'true'
         run: bash scripts/finalize-apks.sh
 
-      # ── 8. Release ────────────────────────────────────────────
+      # ── 9. Release ────────────────────────────────────────────
       - name: Create Release
         if: steps.check.outputs.trigger == 'true'
         uses: softprops/action-gh-release@v2
@@ -98,7 +105,7 @@ jobs:
             ### Metrolist Neo
             Automated build from upstream tag: ${{ steps.check.outputs.tag }}
 
-            Original: https://github.com/MetrolistGroup/Metrolist/releases/tag/${{ steps.check.outputs.tag }}
+            Original: https://github.com/mostafaalagamy/Metrolist/releases/tag/${{ steps.check.outputs.tag }}
           files: output_apks/*.apk
           draft: false
           prerelease: false

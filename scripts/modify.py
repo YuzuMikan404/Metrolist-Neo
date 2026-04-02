@@ -2,40 +2,48 @@
 """
 scripts/modify.py  —  Metrolist Neo build patcher
 
-やること（最小限）:
-  1. アイコン差し替え（icon.png があれば）
-  2. applicationId を APP_ID に変更
-  3. アプリ名を APP_NAME に変更
-  4. AndroidManifest の label/icon を更新
-  5. MessageCodec.kt を修正
-     → v13.2.1 で protobuf が削除されたのに MessageCodec.kt だけ
-       旧 proto API のままになっているバグを修正する
-  6. gradle.properties に CI 用 JVM 設定をマージ
-
-やらないこと:
-  - google-services.json の生成（v13.2.1 では不要）
-  - Firebase/Crashlytics の無効化（v13.2.1 では元から存在しない）
-  - protobuf プラグインの注入（不要）
+やること:
+  1. アイコン色変更（ベクターXML書き換え）
+  2. applicationId と namespace を APP_ID (com.metrolist.clone) に変更
+  3. ソースコード全体の import を com.metrolist.music.R / BuildConfig
+     → com.metrolist.clone.R / BuildConfig に書き換え
+     （namespace を clone にした場合、Gradle が生成する R/BuildConfig の
+       パッケージが clone になるため、ソース側も合わせる必要がある）
+  4. アプリ名を APP_NAME に変更
+  5. AndroidManifest の label/icon を更新
+  6. MessageCodec.kt を修正（proto API → kotlinx.serialization）
+  7. gradle.properties に CI 用 JVM 設定をマージ
+  8. build.gradle.kts の buildFeatures.buildConfig = true を保証
 """
 
 import os
 import re
 import sys
+from pathlib import Path
 
 # ── CONFIG ────────────────────────────────────────────────────
 APP_NAME = "Metrolist Neo"
 APP_ID   = "com.metrolist.clone"
 
+# upstream ソースの元パッケージ（書き換え元）
+UPSTREAM_PKG = "com.metrolist.music"
+
 # アイコンの色設定
-ICON_BG_START  = "#0055AA"   # グラデーション開始色（濃い青）
-ICON_BG_END    = "#00ACEE"   # グラデーション終了色（シアン）
-ICON_FG_COLOR  = "#FFFFFFFF" # 前景（矢印）の色
+ICON_BG_START  = "#0055AA"
+ICON_BG_END    = "#00ACEE"
+ICON_FG_COLOR  = "#FFFFFFFF"
 
 BASE_DIR      = "app"
 RES_DIR       = os.path.join(BASE_DIR, "src/main/res")
 GRADLE_FILE   = os.path.join(BASE_DIR, "build.gradle.kts")
 MANIFEST_FILE = os.path.join(BASE_DIR, "src/main/AndroidManifest.xml")
-PROGUARD_FILE = os.path.join(BASE_DIR, "proguard-rules.pro")
+
+# ソースルート（import 書き換え対象のディレクトリ）
+SRC_ROOTS = [
+    os.path.join(BASE_DIR, "src/main/kotlin"),
+    os.path.join(BASE_DIR, "src/gms/kotlin"),
+    os.path.join(BASE_DIR, "src/foss/kotlin"),
+]
 
 MESSAGE_CODEC_PATH = os.path.join(
     BASE_DIR,
@@ -43,39 +51,35 @@ MESSAGE_CODEC_PATH = os.path.join(
 )
 # ─────────────────────────────────────────────────────────────
 
+
 def log(msg):
     print(f"[modify.py] {msg}", flush=True)
+
 
 def die(msg):
     print(f"[modify.py] ERROR: {msg}", file=sys.stderr, flush=True)
     sys.exit(1)
 
+
 def read_file(path, encoding="utf-8"):
     try:
-        return open(path, encoding=encoding).read()
+        with open(path, encoding=encoding) as f:
+            return f.read()
     except OSError as e:
         die(f"Cannot read {path}: {e}")
 
+
 def write_file(path, content, encoding="utf-8"):
     try:
-        open(path, "w", encoding=encoding).write(content)
+        with open(path, "w", encoding=encoding) as f:
+            f.write(content)
     except OSError as e:
         die(f"Cannot write {path}: {e}")
 
 
-# ── 1. アイコン色変更 ─────────────────────────────────────────
-# 元の XML ベクターアイコンをそのまま使い、色だけ書き換える。
-# 画像ファイル不要。upstream のアイコン構造を維持しつつ色だけ変更する。
-#
-# 変更対象:
-#   drawable/ic_launcher_background_v31.xml     → グラデーション色
-#   drawable-v31/ic_launcher_background_v31.xml → グラデーション色
-#   drawable/ic_launcher_foreground.xml         → 矢印の stroke 色
-#   drawable/ic_launcher_foreground_v31.xml     → 矢印の stroke 色
-#   values/ic_launcher_background.xml           → フォールバック単色
-
+# ── 1. アイコン色変更 ──────────────────────────────────────────
 def patch_icon_colors():
-    log(f"Patching icon colors (bg: {ICON_BG_START}\u2192{ICON_BG_END}, fg: {ICON_FG_COLOR})...")
+    log(f"Patching icon colors (bg: {ICON_BG_START}→{ICON_BG_END}, fg: {ICON_FG_COLOR})...")
 
     bg_gradient_xml = (
         '<?xml version="1.0" encoding="utf-8"?>\n'
@@ -100,13 +104,16 @@ def patch_icon_colors():
     bg_color_path = os.path.join(RES_DIR, "values/ic_launcher_background.xml")
     if os.path.exists(bg_color_path):
         txt = read_file(bg_color_path)
-        new = re.sub(r'<color name="ic_launcher_background">[^<]*</color>',
-                     f'<color name="ic_launcher_background">{ICON_BG_START}</color>', txt)
+        new = re.sub(
+            r'<color name="ic_launcher_background">[^<]*</color>',
+            f'<color name="ic_launcher_background">{ICON_BG_START}</color>',
+            txt,
+        )
         if new != txt:
             write_file(bg_color_path, new)
             log("  Updated: values/ic_launcher_background.xml")
         else:
-            log("  Warning: ic_launcher_background color pattern not found, skipped.")
+            log("  Warning: ic_launcher_background color pattern not found.")
     else:
         log("  Skipped (not found): values/ic_launcher_background.xml")
 
@@ -115,42 +122,30 @@ def patch_icon_colors():
         path = os.path.join(RES_DIR, rel)
         if os.path.exists(path):
             txt = read_file(path)
-            new = re.sub(r'android:strokeColor="[^"]*"',
-                         f'android:strokeColor="{ICON_FG_COLOR}"', txt)
+            new = re.sub(
+                r'android:strokeColor="[^"]*"',
+                f'android:strokeColor="{ICON_FG_COLOR}"',
+                txt,
+            )
             if new != txt:
                 write_file(path, new)
                 log(f"  Updated: {rel}")
             else:
-                log(f"  Warning: strokeColor pattern not found in {rel}, skipped.")
+                log(f"  Warning: strokeColor pattern not found in {rel}.")
         else:
             log(f"  Skipped (not found): {rel}")
 
 
-# ── 2. applicationId ─────────────────────────────────────────
+# ── 2. applicationId と namespace を APP_ID に変更 ────────────
 #
-# v13.4.0 で build.gradle.kts の構造が変わった:
+# namespace を APP_ID に変更することで、Gradle が生成する
+# R クラスと BuildConfig のパッケージが com.metrolist.clone になる。
+# この後のステップ3でソースコード側の import も合わせて書き換える。
 #
-#   旧（〜v13.3.x）:
-#     applicationId = "com.metrolist.music"
-#
-#   新（v13.4.0+）:
-#     val baseApplicationId = "com.metrolist.music"
-#     val applicationIdOverride = System.getenv("METROLIST_APPLICATION_ID")?.takeIf { it.isNotBlank() }
-#     ...
-#     applicationId = applicationIdOverride ?: baseApplicationId
-#
-# 旧パターンは `applicationId = "..."` の文字列リテラルを直接置換できたが、
-# 新パターンでは `applicationId` の右辺が変数式になっているため正規表現がマッチしない。
-# → "applicationId unchanged (already correct?)" と誤判定してスキップされていた。
-#
-# 修正方針:
-#   1. まず新パターン（baseApplicationId 変数）を試みる
-#   2. 見つからなければ旧パターン（applicationId = "..." 直接代入）を試みる
-#   3. namespace も同一 package を指している場合は合わせて書き換える
-#   4. どちらも見つからなければ WARNING を出し、手動確認を促す（die しない）
-
+# v13.4.0+ パターン: val baseApplicationId = "..."
+# 旧パターン:        applicationId = "..." (文字列リテラル)
 def patch_application_id():
-    log(f"Patching applicationId → {APP_ID}...")
+    log(f"Patching applicationId + namespace → {APP_ID}...")
     if not os.path.exists(GRADLE_FILE):
         die(f"Not found: {GRADLE_FILE}")
 
@@ -168,8 +163,8 @@ def patch_application_id():
         log(f"  baseApplicationId patched ({n} occurrence(s)).")
         patched = True
 
-    # パターン2: 旧スタイル — applicationId = "..." (直接文字列リテラル)
-    # ただし applicationIdOverride や applicationIdSuffix は触らない
+    # パターン2: 旧スタイル — applicationId = "..." (文字列リテラル直接代入)
+    # applicationIdSuffix / applicationIdOverride は除外
     new, n = re.subn(
         r'(?<!\w)(applicationId\s*=\s*)"[^"]*"',
         rf'\1"{APP_ID}"',
@@ -179,35 +174,130 @@ def patch_application_id():
         log(f"  applicationId (literal) patched ({n} occurrence(s)).")
         patched = True
 
-    # パターン3: namespace も元パッケージを指していれば合わせて書き換える
-    # ※ namespace はビルド上の R クラス生成に使うだけで applicationId とは独立だが、
-    #    fork 運用では一致させておく方が混乱が少ない。不要なら削除してよい。
+    # パターン3: namespace も書き換える
+    # namespace を APP_ID にすることで R/BuildConfig が com.metrolist.clone.* になる
     new, n = re.subn(
-        r'(namespace\s*=\s*)"com\.metrolist\.music"',
+        r'(namespace\s*=\s*)"[^"]*"',
         rf'\1"{APP_ID}"',
         new,
     )
     if n:
-        log(f"  namespace patched ({n} occurrence(s)).")
+        log(f"  namespace patched to {APP_ID} ({n} occurrence(s)).")
 
     if not patched:
         log("  WARNING: applicationId pattern not found. Manual check needed.")
         log(f"    File: {GRADLE_FILE}")
-        return  # die せず続行（他のパッチは適用する）
+        return
 
     if new != txt:
         write_file(GRADLE_FILE, new)
+        log("  build.gradle.kts written.")
     else:
-        log("  applicationId already set to the target value — no change needed.")
+        log("  applicationId/namespace already set — no change needed.")
 
 
-# ── 3. アプリ名 ───────────────────────────────────────────────
+# ── 3. ソースコード全体の import 書き換え ────────────────────
+#
+# namespace = com.metrolist.clone にすると、Gradle が生成する
+# R クラスと BuildConfig のパッケージが com.metrolist.clone になる。
+# ソースコードは元々 com.metrolist.music.R / BuildConfig を
+# import しているので、これを com.metrolist.clone.R / BuildConfig に変更する。
+#
+# 対象: import com.metrolist.music.R
+#        import com.metrolist.music.BuildConfig
+#
+# ※ package 宣言 (package com.metrolist.music) はそのままでよい。
+#   クラス自体のパッケージは変えず、生成クラスへの参照だけ変える。
+def patch_source_imports():
+    log(f"Patching source imports: {UPSTREAM_PKG}.R/BuildConfig → {APP_ID}.R/BuildConfig ...")
+
+    # 書き換え対象のパターン（R と BuildConfig のみ、他の music.* クラスは触らない）
+    patterns = [
+        # import com.metrolist.music.R
+        (
+            re.compile(rf'import\s+{re.escape(UPSTREAM_PKG)}\.R\b'),
+            f'import {APP_ID}.R',
+        ),
+        # import com.metrolist.music.BuildConfig
+        (
+            re.compile(rf'import\s+{re.escape(UPSTREAM_PKG)}\.BuildConfig\b'),
+            f'import {APP_ID}.BuildConfig',
+        ),
+    ]
+
+    total_files = 0
+    total_changes = 0
+
+    for src_root in SRC_ROOTS:
+        if not os.path.isdir(src_root):
+            log(f"  Skipped (not found): {src_root}")
+            continue
+
+        for kt_file in Path(src_root).rglob("*.kt"):
+            txt = read_file(str(kt_file))
+            new = txt
+            changed = False
+
+            for pattern, replacement in patterns:
+                replaced, n = pattern.subn(replacement, new)
+                if n:
+                    new = replaced
+                    changed = True
+                    total_changes += n
+
+            if changed:
+                write_file(str(kt_file), new)
+                total_files += 1
+
+    log(f"  Done: {total_changes} import(s) rewritten in {total_files} file(s).")
+
+
+# ── 4. buildConfig = true を保証 ─────────────────────────────
+#
+# BuildConfig クラスの生成には buildFeatures { buildConfig = true } が必要。
+# AGP 8.0 以降はデフォルト無効。
+def ensure_build_config_enabled():
+    log("Ensuring buildFeatures.buildConfig = true...")
+    if not os.path.exists(GRADLE_FILE):
+        die(f"Not found: {GRADLE_FILE}")
+
+    txt = read_file(GRADLE_FILE)
+
+    if re.search(r'buildConfig\s*=\s*true', txt):
+        log("  buildConfig = true already present — skipping.")
+        return
+
+    if "buildFeatures" in txt:
+        new = re.sub(
+            r'(buildFeatures\s*\{)',
+            r'\1\n        buildConfig = true',
+            txt,
+            count=1,
+        )
+        if new != txt:
+            write_file(GRADLE_FILE, new)
+            log("  buildConfig = true injected into existing buildFeatures block.")
+            return
+
+    new = re.sub(
+        r'(android\s*\{)',
+        r'\1\n    buildFeatures {\n        buildConfig = true\n    }',
+        txt,
+        count=1,
+    )
+    if new != txt:
+        write_file(GRADLE_FILE, new)
+        log("  buildFeatures { buildConfig = true } block inserted.")
+    else:
+        log("  WARNING: Could not inject buildFeatures block. Manual check needed.")
+
+
+# ── 5. アプリ名 ───────────────────────────────────────────────
 def write_app_name():
     log(f"Writing app_name: {APP_NAME!r}...")
     pattern = re.compile(r'\s*<string\s+name="app_name"[^>]*>[^<]*</string>', re.MULTILINE)
     entry   = f'<string name="app_name">{APP_NAME}</string>'
 
-    # 既存の app_name エントリを全 values* ディレクトリから除去
     for root, _, files in os.walk(RES_DIR):
         if not os.path.basename(root).startswith("values"):
             continue
@@ -230,7 +320,6 @@ def write_app_name():
             except Exception as exc:
                 log(f"  Warning: {fp}: {exc}")
 
-    # values/strings.xml に書き込む
     os.makedirs(os.path.join(RES_DIR, "values"), exist_ok=True)
     sp = os.path.join(RES_DIR, "values", "strings.xml")
     if os.path.exists(sp):
@@ -241,13 +330,14 @@ def write_app_name():
             txt = re.sub(r"(<resources[^>]*>)", rf"\1\n    {entry}", txt, count=1)
         write_file(sp, txt)
     else:
-        write_file(sp,
-            f'<?xml version="1.0" encoding="utf-8"?>\n<resources>\n    {entry}\n</resources>'
+        write_file(
+            sp,
+            f'<?xml version="1.0" encoding="utf-8"?>\n<resources>\n    {entry}\n</resources>',
         )
     log(f"  app_name written to {sp}")
 
 
-# ── 4. AndroidManifest ────────────────────────────────────────
+# ── 6. AndroidManifest ────────────────────────────────────────
 def patch_manifest():
     log(f"Patching {MANIFEST_FILE}...")
     if not os.path.exists(MANIFEST_FILE):
@@ -256,23 +346,22 @@ def patch_manifest():
     txt = re.sub(r'android:label="[^"]*"',  'android:label="@string/app_name"', txt)
     txt = re.sub(r'android:icon="[^"]*"',   'android:icon="@mipmap/ic_launcher"', txt)
     if "android:roundIcon=" in txt:
-        txt = re.sub(r'android:roundIcon="[^"]*"', 'android:roundIcon="@mipmap/ic_launcher_round"', txt)
+        txt = re.sub(
+            r'android:roundIcon="[^"]*"',
+            'android:roundIcon="@mipmap/ic_launcher_round"',
+            txt,
+        )
     else:
-        txt = txt.replace("<application", '<application android:roundIcon="@mipmap/ic_launcher_round"', 1)
+        txt = txt.replace(
+            "<application",
+            '<application android:roundIcon="@mipmap/ic_launcher_round"',
+            1,
+        )
     write_file(MANIFEST_FILE, txt)
     log("  AndroidManifest patched.")
 
 
-# ── 5. MessageCodec.kt の修正 ─────────────────────────────────
-#
-# 問題: v13.2.1 で upstream が listentogether/ パッケージを
-#       protobuf → kotlinx.serialization に書き直したが、
-#       MessageCodec.kt だけ旧 proto API のままになっていた。
-#
-# 修正: 公開 API（クラス名・メソッドシグネチャ）を完全に維持したまま
-#       kotlinx.serialization JSON + GZIP 圧縮で再実装する。
-#       ListenTogetherClient.kt 側は一切変更不要。
-
+# ── 7. MessageCodec.kt の修正 ─────────────────────────────────
 _MESSAGE_CODEC_SOURCE = '''\
 /**
  * Metrolist Project (C) 2026
@@ -298,10 +387,6 @@ import java.util.zip.GZIPOutputStream
 
 /**
  * Codec for encoding and decoding ListenTogether wire messages.
- *
- * v13.2.1 で削除された protobuf (Listentogether.* / proto パッケージ) の
- * 代替実装。kotlinx.serialization JSON + オプション GZIP 圧縮を使用。
- * 公開 API は元のクラスと完全に同一。
  *
  * Wire format: {"type":"<TYPE>","compressed":<bool>,"payload":"<JSON>"}
  */
@@ -392,7 +477,9 @@ class MessageCodec(
         is ApproveSuggestionPayload -> json.encodeToJsonElement(payload)
         is RejectSuggestionPayload  -> json.encodeToJsonElement(payload)
         is ReconnectPayload         -> json.encodeToJsonElement(payload)
-        else -> throw IllegalArgumentException("Unsupported payload type: ${payload::class.simpleName}")
+        else -> throw IllegalArgumentException(
+            "Unsupported payload type: ${payload::class.simpleName}"
+        )
     }
 
     private fun compress(data: ByteArray): ByteArray {
@@ -424,16 +511,18 @@ def replace_message_codec():
         log("  Already up to date — no change.")
 
 
-# ── 6. gradle.properties（CI 用 JVM 設定のみ） ────────────────
+# ── 8. gradle.properties ─────────────────────────────────────
 def patch_gradle_properties():
     log("Patching gradle.properties...")
     desired = {
         "org.gradle.jvmargs":
             "-Xmx4096m -XX:MaxMetaspaceSize=1g -XX:+HeapDumpOnOutOfMemoryError -Dfile.encoding=UTF-8",
         "kotlin.daemon.jvmargs": "-Xmx4096m -XX:MaxMetaspaceSize=1g",
-        "org.gradle.parallel":       "true",
-        "org.gradle.caching":        "true",
-        "android.enableJetifier":    "false",
+        "org.gradle.parallel":    "true",
+        "org.gradle.caching":     "true",
+        "android.enableJetifier": "false",
+        # AGP 8.0+ で BuildConfig 生成を明示的に有効化
+        "android.defaults.buildfeatures.buildconfig": "true",
     }
     path = "gradle.properties"
     lines = open(path).readlines() if os.path.exists(path) else []
@@ -441,24 +530,29 @@ def patch_gradle_properties():
     for line in lines:
         s = line.strip()
         if not s or s.startswith("#") or "=" not in s:
-            result.append(line); continue
+            result.append(line)
+            continue
         key = s.split("=", 1)[0].strip()
         if key in desired:
-            result.append(f"{key}={desired[key]}\n"); replaced.add(key)
+            result.append(f"{key}={desired[key]}\n")
+            replaced.add(key)
         else:
             result.append(line)
     for k, v in desired.items():
         if k not in replaced:
             result.append(f"{k}={v}\n")
-    open(path, "w").writelines(result)
+    with open(path, "w") as f:
+        f.writelines(result)
     log("  gradle.properties patched.")
 
 
-# ── Main ─────────────────────────────────────────────────────
+# ── Main ──────────────────────────────────────────────────────
 if __name__ == "__main__":
     try:
         patch_icon_colors()
         patch_application_id()
+        ensure_build_config_enabled()
+        patch_source_imports()   # ← namespace=clone に合わせて import を書き換える
         write_app_name()
         patch_manifest()
         replace_message_codec()
@@ -467,5 +561,6 @@ if __name__ == "__main__":
     except SystemExit:
         raise
     except Exception as exc:
-        import traceback; traceback.print_exc()
+        import traceback
+        traceback.print_exc()
         die(str(exc))
