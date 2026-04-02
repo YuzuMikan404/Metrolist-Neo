@@ -211,22 +211,27 @@ def patch_application_id():
 def patch_source_imports():
     log(f"Patching source imports: {UPSTREAM_PKG}.R/BuildConfig → {APP_ID}.R/BuildConfig ...")
 
-    # 書き換え対象のパターン（R と BuildConfig のみ、他の music.* クラスは触らない）
-    patterns = [
-        # import com.metrolist.music.R
-        (
-            re.compile(rf'import\s+{re.escape(UPSTREAM_PKG)}\.R\b'),
-            f'import {APP_ID}.R',
-        ),
-        # import com.metrolist.music.BuildConfig
-        (
-            re.compile(rf'import\s+{re.escape(UPSTREAM_PKG)}\.BuildConfig\b'),
-            f'import {APP_ID}.BuildConfig',
-        ),
+    # ── パターン定義 ──────────────────────────────────────────
+    # (既存 import の書き換えパターン, 使用検出パターン, 追加する import 文)
+    targets = [
+        {
+            "rewrite":  re.compile(rf'import\s+{re.escape(UPSTREAM_PKG)}\.R\b'),
+            "replace":  f'import {APP_ID}.R',
+            # R.string.xxx / R.drawable.xxx / R.id.xxx 等の使用を検出
+            "use_pat":  re.compile(r'\bR\.(?:string|drawable|id|layout|mipmap|color|dimen|attr|style|anim|array|bool|integer|menu|raw|xml|font|plurals)\b'),
+            "import":   f'import {APP_ID}.R',
+        },
+        {
+            "rewrite":  re.compile(rf'import\s+{re.escape(UPSTREAM_PKG)}\.BuildConfig\b'),
+            "replace":  f'import {APP_ID}.BuildConfig',
+            "use_pat":  re.compile(r'\bBuildConfig\.'),
+            "import":   f'import {APP_ID}.BuildConfig',
+        },
     ]
 
+    total_rewrites = 0
+    total_injections = 0
     total_files = 0
-    total_changes = 0
 
     for src_root in SRC_ROOTS:
         if not os.path.isdir(src_root):
@@ -238,18 +243,42 @@ def patch_source_imports():
             new = txt
             changed = False
 
-            for pattern, replacement in patterns:
-                replaced, n = pattern.subn(replacement, new)
+            for t in targets:
+                # Step1: 既存 import を書き換え
+                replaced, n = t["rewrite"].subn(t["replace"], new)
                 if n:
                     new = replaced
                     changed = True
-                    total_changes += n
+                    total_rewrites += n
+                    continue  # import を書き換えたので追加不要
+
+                # Step2: import がないが実際に使用しているファイルへ注入
+                already_imported = t["replace"] in new
+                if already_imported:
+                    continue
+                if not t["use_pat"].search(new):
+                    continue
+
+                # package 宣言の直後に import を挿入
+                injected, m = re.subn(
+                    r'(^package\s+\S+\s*\n)',
+                    rf'\1\n{t["import"]}\n',
+                    new,
+                    count=1,
+                    flags=re.MULTILINE,
+                )
+                if m:
+                    new = injected
+                    changed = True
+                    total_injections += 1
 
             if changed:
                 write_file(str(kt_file), new)
                 total_files += 1
 
-    log(f"  Done: {total_changes} import(s) rewritten in {total_files} file(s).")
+    log(f"  Done: {total_rewrites} import(s) rewritten, "
+        f"{total_injections} import(s) injected, "
+        f"in {total_files} file(s) total.")
 
 
 # ── 4. buildConfig = true を保証 ─────────────────────────────
