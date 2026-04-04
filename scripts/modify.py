@@ -226,11 +226,14 @@ def ensure_build_config_enabled():
 # ── 4. アプリ名 ───────────────────────────────────────────────
 def write_app_name():
     log(f"Writing app_name: {APP_NAME!r}...")
-    pattern = re.compile(r'\s*<string\s+name="app_name"[^>]*>[^<]*</string>', re.MULTILINE)
-    entry   = f'<string name="app_name">{APP_NAME}</string>'
+    entry = f'<string name="app_name">{APP_NAME}</string>'
 
+    # values/ および values-xx/ 配下のすべての XML を対象に
+    # app_name エントリを APP_NAME に置換する。
+    # アプリ名は翻訳すべきでないため、全言語リソースで統一した値にする。
     for root, _, files in os.walk(RES_DIR):
-        if not os.path.basename(root).startswith("values"):
+        dirname = os.path.basename(root)
+        if not dirname.startswith("values"):
             continue
         for fname in files:
             if not fname.endswith(".xml"):
@@ -240,32 +243,35 @@ def write_app_name():
                 txt = read_file(fp)
                 if 'name="app_name"' not in txt:
                     continue
-                cleaned = pattern.sub("", txt)
-                body = re.sub(r"<\?xml[^?]*\?>|</?resources[^>]*>", "", cleaned).strip()
-                if not body:
-                    os.remove(fp)
-                    log(f"  Removed empty: {fp}")
+                new = re.sub(
+                    r'<string\s+name="app_name"[^>]*>[^<]*</string>',
+                    entry,
+                    txt,
+                )
+                if new != txt:
+                    write_file(fp, new)
+                    log(f"  Updated: {fp}")
                 else:
-                    write_file(fp, cleaned)
-                    log(f"  Cleaned: {fp}")
+                    log(f"  No change needed: {fp}")
             except Exception as exc:
                 log(f"  Warning: {fp}: {exc}")
 
+    # values/strings.xml が存在しない場合は新規作成
     os.makedirs(os.path.join(RES_DIR, "values"), exist_ok=True)
     sp = os.path.join(RES_DIR, "values", "strings.xml")
-    if os.path.exists(sp):
-        txt = read_file(sp)
-        if 'name="app_name"' in txt:
-            txt = re.sub(r'<string\s+name="app_name"[^>]*>[^<]*</string>', entry, txt)
-        else:
-            txt = re.sub(r"(<resources[^>]*>)", rf"\1\n    {entry}", txt, count=1)
-        write_file(sp, txt)
-    else:
+    if not os.path.exists(sp):
         write_file(
             sp,
             f'<?xml version="1.0" encoding="utf-8"?>\n<resources>\n    {entry}\n</resources>',
         )
-    log(f"  app_name written to {sp}")
+        log(f"  Created: {sp}")
+    elif 'name="app_name"' not in read_file(sp):
+        # strings.xml はあるが app_name がない場合は追記
+        txt = read_file(sp)
+        txt = re.sub(r"(<resources[^>]*>)", rf"\1\n    {entry}", txt, count=1)
+        write_file(sp, txt)
+        log(f"  app_name injected into {sp}")
+    log(f"  app_name = {APP_NAME!r} applied to all values resources.")
 
 
 # ── 5. AndroidManifest ────────────────────────────────────────
