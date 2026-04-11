@@ -13,6 +13,14 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 90
 
+    # ── クローン固有の設定 ──────────────────────────────────────
+    # アプリ名・パッケージ名はここで一元管理する。
+    # modify.py は XML を直接書き換えず、build.gradle.kts の
+    # resValue / applicationId 仕組みに委ねる。
+    env:
+      CLONE_APP_NAME:       "Metrolist Neo"
+      CLONE_APPLICATION_ID: "com.metrolist.clone"
+
     steps:
       # ── 1. Checkout ───────────────────────────────────────────
       - name: Checkout
@@ -53,19 +61,30 @@ jobs:
         run: bash scripts/fetch-source.sh "${{ steps.check.outputs.tag }}"
 
       # ── 5. Patch source ───────────────────────────────────────
+      # modify.py がやること:
+      #   - app_name.xml の削除（resValue との重複防止）
+      #   - アイコン色変更
+      #   - MessageCodec.kt の修正（proto → kotlinx.serialization）
+      #   - gradle.properties の CI 最適化
+      #
+      # やらないこと（環境変数で制御するため）:
+      #   - アプリ名の XML 書き換え → METROLIST_APP_NAME で制御
+      #   - applicationId の書き換え → METROLIST_APPLICATION_ID で制御
       - name: Apply Modifications
         if: steps.check.outputs.trigger == 'true'
         run: python3 scripts/modify.py
 
       # ── 6. Build ──────────────────────────────────────────────
-      # LASTFM キーは secrets から取得する。
-      # secrets が未設定の場合はダミー値にフォールバックし、
-      # LastFM 機能が無効化された状態でビルドが通る。
+      # METROLIST_APP_NAME / METROLIST_APPLICATION_ID を渡すことで
+      # build.gradle.kts の resValue / applicationId が上書きされる。
+      # LASTFM キーは secrets から取得し、未設定時はダミー値にフォールバック。
       - name: Build APK
         if: steps.check.outputs.trigger == 'true'
         env:
-          LASTFM_API_KEY: ${{ secrets.LASTFM_API_KEY }}
-          LASTFM_SECRET:  ${{ secrets.LASTFM_SECRET }}
+          METROLIST_APP_NAME:       ${{ env.CLONE_APP_NAME }}
+          METROLIST_APPLICATION_ID: ${{ env.CLONE_APPLICATION_ID }}
+          LASTFM_API_KEY:           ${{ secrets.LASTFM_API_KEY }}
+          LASTFM_SECRET:            ${{ secrets.LASTFM_SECRET }}
         run: |
           : "${LASTFM_API_KEY:=dummy_key}"
           : "${LASTFM_SECRET:=dummy_secret}"
@@ -84,10 +103,10 @@ jobs:
         id: sign
         with:
           releaseDir: output_apks
-          signingKey: ${{ secrets.SIGNING_KEY }}
-          keyAlias: ${{ secrets.ALIAS }}
-          keyStorePassword: ${{ secrets.KEY_STORE_PASSWORD }}
-          keyPassword: ${{ secrets.KEY_PASSWORD }}
+          signingKey:        ${{ secrets.SIGNING_KEY }}
+          keyAlias:          ${{ secrets.ALIAS }}
+          keyStorePassword:  ${{ secrets.KEY_STORE_PASSWORD }}
+          keyPassword:       ${{ secrets.KEY_PASSWORD }}
           buildToolsVersion: "34.0.0"
 
       - name: Finalize Artifacts
@@ -100,14 +119,14 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ steps.check.outputs.tag }}
-          name: ${{ steps.check.outputs.tag }}
+          name:     ${{ steps.check.outputs.tag }}
           body: |
-            ### Metrolist Neo
+            ### ${{ env.CLONE_APP_NAME }}
             Automated build from upstream tag: ${{ steps.check.outputs.tag }}
 
             Original: https://github.com/mostafaalagamy/Metrolist/releases/tag/${{ steps.check.outputs.tag }}
           files: output_apks/*.apk
-          draft: false
+          draft:      false
           prerelease: false
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
