@@ -3,24 +3,37 @@
 scripts/modify.py  —  Metrolist Neo build patcher
 
 【設計方針】
-  Android では namespace と applicationId は独立した設定。
-    - namespace    = Rクラス・BuildConfigのJavaパッケージ名
-                     → com.metrolist.music のまま維持
-                     → ソースコード全体がこのパッケージで R/BuildConfig を参照している
-    - applicationId = APKのアプリ識別子（インストール時・Play Storeで使われる）
-                     → com.metrolist.clone に変更
+  アプリ名・applicationId の変更は build.gradle.kts の既存の仕組みを使う。
 
-  namespace を変えようとしたことが過去のエラーの根本原因だった。
-  applicationId だけ変更すれば R/BuildConfig の import は一切触る必要がない。
+    build.gradle.kts には以下の環境変数サポートが既に実装されている:
+      METROLIST_APPLICATION_ID → applicationId を上書き
+      METROLIST_APP_NAME       → resValue("string", "app_name", ...) を上書き
+
+    resValue() はビルド時に string/app_name を自動生成するため、
+    app_name.xml が同時に存在すると「Duplicate resources」エラーになる。
+    → app_name.xml は必ず削除する。modify.py で XML を直接書き換えない。
+
+  namespace は絶対に触らない。
+    namespace = "com.metrolist.music" のまま維持。
+    R クラス・BuildConfig の Java パッケージに使われるため、
+    ソースコード全体と一致させる必要がある。
 
 やること:
-  1. アイコン色変更
-  2. applicationId を com.metrolist.clone に変更（namespace は触らない）
-  3. アプリ名を Metrolist Neo に変更
-  4. AndroidManifest の label/icon を更新
-  5. MessageCodec.kt を修正（proto API → kotlinx.serialization）
-  6. gradle.properties に CI 用 JVM 設定をマージ
-  7. buildFeatures.buildConfig = true を保証
+  1. app_name.xml を削除（resValue と重複するため）
+  2. アイコン色変更（グラデーション背景・前景の strokeColor）
+  3. MessageCodec.kt を修正
+       アップストリームは proto API (Listentogether.*) を参照しているが、
+       proto ファイルも protobuf gradle プラグインも存在しないため
+       ビルドが通らない。Protocol.kt の @Serializable クラスを使う
+       kotlinx.serialization 実装に置き換える。
+  4. gradle.properties に CI 用 JVM 設定をマージ
+
+やらないこと（理由付き）:
+  - app_name.xml の書き換え → resValue と重複するため削除のみ
+  - strings.xml への app_name 追記 → 同上
+  - AndroidManifest の書き換え → label は既に @string/app_name 参照済み
+  - namespace の変更 → R/BuildConfig のパッケージに使われるため禁止
+  - applicationId の直接書き換え → 環境変数で制御するため不要
 """
 
 import os
@@ -29,20 +42,12 @@ import sys
 from pathlib import Path
 
 # ── CONFIG ────────────────────────────────────────────────────
-APP_NAME       = "Metrolist Neo"
-APPLICATION_ID = "com.metrolist.clone"   # APK識別子のみ変更
+ICON_BG_START = "#0055AA"
+ICON_BG_END   = "#00ACEE"
+ICON_FG_COLOR = "#FFFFFFFF"
 
-# namespace = "com.metrolist.music" は変更しない
-# （R/BuildConfig のパッケージに使われるため、ソースと一致させる必要がある）
-
-ICON_BG_START  = "#0055AA"
-ICON_BG_END    = "#00ACEE"
-ICON_FG_COLOR  = "#FFFFFFFF"
-
-BASE_DIR      = "app"
-RES_DIR       = os.path.join(BASE_DIR, "src/main/res")
-GRADLE_FILE   = os.path.join(BASE_DIR, "build.gradle.kts")
-MANIFEST_FILE = os.path.join(BASE_DIR, "src/main/AndroidManifest.xml")
+BASE_DIR = "app"
+RES_DIR  = os.path.join(BASE_DIR, "src/main/res")
 
 MESSAGE_CODEC_PATH = os.path.join(
     BASE_DIR,
@@ -51,16 +56,16 @@ MESSAGE_CODEC_PATH = os.path.join(
 # ─────────────────────────────────────────────────────────────
 
 
-def log(msg):
+def log(msg: str) -> None:
     print(f"[modify.py] {msg}", flush=True)
 
 
-def die(msg):
+def die(msg: str) -> None:
     print(f"[modify.py] ERROR: {msg}", file=sys.stderr, flush=True)
     sys.exit(1)
 
 
-def read_file(path, encoding="utf-8"):
+def read_file(path: str, encoding: str = "utf-8") -> str:
     try:
         with open(path, encoding=encoding) as f:
             return f.read()
@@ -68,7 +73,7 @@ def read_file(path, encoding="utf-8"):
         die(f"Cannot read {path}: {e}")
 
 
-def write_file(path, content, encoding="utf-8"):
+def write_file(path: str, content: str, encoding: str = "utf-8") -> None:
     try:
         with open(path, "w", encoding=encoding) as f:
             f.write(content)
@@ -76,12 +81,78 @@ def write_file(path, content, encoding="utf-8"):
         die(f"Cannot write {path}: {e}")
 
 
-# ── 1. アイコン色変更 ──────────────────────────────────────────
-def patch_icon_colors():
+# ── 1. app_name.xml を削除 ────────────────────────────────────
+#
+# build.gradle.kts は resValue("string", "app_name", ...) でアプリ名を
+# ビルド時に生成する。app_name.xml が残っていると Duplicate resources エラー。
+# 環境変数 METROLIST_APP_NAME の値が resValue に使われる。
+#
+# values-xx/ 配下に app_name を持つ翻訳ファイルがある場合も同様に削除する。
+# （実際には values/ にしか存在しないが、念のため全探索する）
+def remove_app_name_xml() -> None:
+    log("Removing app_name.xml to avoid resValue conflict...")
+    removed = 0
+
+    for root, _dirs, files in os.walk(RES_DIR):
+        dirname = os.path.basename(root)
+        if not dirname.startswith("values"):
+            continue
+        target = os.path.join(root, "app_name.xml")
+        if os.path.exists(target):
+            os.remove(target)
+            log(f"  Deleted: {target}")
+            removed += 1
+
+    if removed == 0:
+        log("  app_name.xml not found — nothing to delete.")
+    else:
+        log(f"  Removed {removed} file(s).")
+
+    # strings.xml に app_name エントリが紛れ込んでいる場合も除去する。
+    # （前回の modify.py が追記してしまったケースへの保険）
+    _purge_app_name_from_strings()
+
+
+def _purge_app_name_from_strings() -> None:
+    """strings.xml 内の app_name エントリを除去する（追記済み対策）。"""
+    for root, _dirs, files in os.walk(RES_DIR):
+        dirname = os.path.basename(root)
+        if not dirname.startswith("values"):
+            continue
+        for fname in files:
+            if not fname.endswith(".xml"):
+                continue
+            fp = os.path.join(root, fname)
+            txt = read_file(fp)
+            if 'name="app_name"' not in txt:
+                continue
+            # app_name.xml 以外のファイル（strings.xml 等）から除去
+            if fname == "app_name.xml":
+                continue  # 上で削除済み
+            new = re.sub(
+                r'\s*<string\s+name="app_name"[^>]*>[^<]*</string>',
+                "",
+                txt,
+            )
+            if new != txt:
+                write_file(fp, new)
+                log(f"  Purged app_name entry from: {fp}")
+
+
+# ── 2. アイコン色変更 ──────────────────────────────────────────
+#
+# 変更対象:
+#   drawable/ic_launcher_background_v31.xml      — API 30 以下向けフォールバック
+#   drawable-v31/ic_launcher_background_v31.xml  — API 31 以上向け（adaptive icon）
+#   values/ic_launcher_background.xml            — 色リソース定義
+#   drawable/ic_launcher_foreground.xml          — 前景 strokeColor
+#   drawable/ic_launcher_foreground_v31.xml      — 前景 strokeColor（v31）
+def patch_icon_colors() -> None:
     log(f"Patching icon colors (bg: {ICON_BG_START}→{ICON_BG_END}, fg: {ICON_FG_COLOR})...")
 
-    bg_gradient_xml = (
-        '<?xml version="1.0" encoding="utf-8"?>\n'
+    # API 30 以下向けフォールバック背景（固定色グラデーション）
+    bg_gradient_legacy = (
+        '<!-- Fallback gradient for API < 31 -->\n'
         '<shape xmlns:android="http://schemas.android.com/apk/res/android">\n'
         '    <gradient\n'
         '        android:angle="45.0"\n'
@@ -91,15 +162,30 @@ def patch_icon_colors():
         '</shape>'
     )
 
-    for rel in ("drawable/ic_launcher_background_v31.xml",
-                "drawable-v31/ic_launcher_background_v31.xml"):
+    # API 31 以上向け背景（同じグラデーション — システムカラーは使わない）
+    bg_gradient_v31 = (
+        '<shape xmlns:android="http://schemas.android.com/apk/res/android">\n'
+        '    <gradient\n'
+        '        android:angle="45.0"\n'
+        f'        android:startColor="{ICON_BG_START}"\n'
+        f'        android:endColor="{ICON_BG_END}"\n'
+        '        android:type="linear" />\n'
+        '</shape>'
+    )
+
+    patch_map = {
+        "drawable/ic_launcher_background_v31.xml":     bg_gradient_legacy,
+        "drawable-v31/ic_launcher_background_v31.xml": bg_gradient_v31,
+    }
+    for rel, content in patch_map.items():
         path = os.path.join(RES_DIR, rel)
         if os.path.exists(path):
-            write_file(path, bg_gradient_xml)
+            write_file(path, content)
             log(f"  Updated: {rel}")
         else:
             log(f"  Skipped (not found): {rel}")
 
+    # ic_launcher_background カラーリソース
     bg_color_path = os.path.join(RES_DIR, "values/ic_launcher_background.xml")
     if os.path.exists(bg_color_path):
         txt = read_file(bg_color_path)
@@ -116,193 +202,55 @@ def patch_icon_colors():
     else:
         log("  Skipped (not found): values/ic_launcher_background.xml")
 
-    for rel in ("drawable/ic_launcher_foreground.xml",
-                "drawable/ic_launcher_foreground_v31.xml"):
+    # 前景アイコン strokeColor
+    for rel in (
+        "drawable/ic_launcher_foreground.xml",
+        "drawable/ic_launcher_foreground_v31.xml",
+    ):
         path = os.path.join(RES_DIR, rel)
-        if os.path.exists(path):
-            txt = read_file(path)
-            new = re.sub(
-                r'android:strokeColor="[^"]*"',
-                f'android:strokeColor="{ICON_FG_COLOR}"',
-                txt,
-            )
-            if new != txt:
-                write_file(path, new)
-                log(f"  Updated: {rel}")
-            else:
-                log(f"  Warning: strokeColor pattern not found in {rel}.")
-        else:
+        if not os.path.exists(path):
             log(f"  Skipped (not found): {rel}")
-
-
-# ── 2. applicationId のみ変更（namespace は絶対に触らない） ──
-#
-# Android の正規設計:
-#   namespace    = Rクラス・BuildConfig の Java パッケージ → ソースと一致させる
-#   applicationId = APK の識別子 → 自由に変更可能
-#
-# v13.4.0+ パターン: val baseApplicationId = "..."
-# 旧パターン:        applicationId = "..." (文字列リテラル)
-def patch_application_id():
-    log(f"Patching applicationId → {APPLICATION_ID} (namespace unchanged)...")
-    if not os.path.exists(GRADLE_FILE):
-        die(f"Not found: {GRADLE_FILE}")
-
-    txt = read_file(GRADLE_FILE)
-    new = txt
-    patched = False
-
-    # パターン1: v13.4.0+ — val baseApplicationId = "..."
-    new, n = re.subn(
-        r'(val\s+baseApplicationId\s*=\s*)"[^"]*"',
-        rf'\1"{APPLICATION_ID}"',
-        new,
-    )
-    if n:
-        log(f"  baseApplicationId patched ({n} occurrence(s)).")
-        patched = True
-
-    # パターン2: 旧スタイル直接代入 — applicationId = "..."
-    # applicationIdSuffix / applicationIdOverride は除外
-    new, n = re.subn(
-        r'(?<!\w)(applicationId\s*=\s*)"[^"]*"',
-        rf'\1"{APPLICATION_ID}"',
-        new,
-    )
-    if n:
-        log(f"  applicationId (literal) patched ({n} occurrence(s)).")
-        patched = True
-
-    # namespace は触らない ← ここが過去の失敗の根本原因
-
-    if not patched:
-        log("  WARNING: applicationId pattern not found. Manual check needed.")
-        return
-
-    if new != txt:
-        write_file(GRADLE_FILE, new)
-        log("  build.gradle.kts written.")
-    else:
-        log("  applicationId already correct — no change.")
-
-
-# ── 3. buildConfig = true を保証 ─────────────────────────────
-def ensure_build_config_enabled():
-    log("Ensuring buildFeatures.buildConfig = true...")
-    if not os.path.exists(GRADLE_FILE):
-        die(f"Not found: {GRADLE_FILE}")
-
-    txt = read_file(GRADLE_FILE)
-
-    if re.search(r'buildConfig\s*=\s*true', txt):
-        log("  buildConfig = true already present — skipping.")
-        return
-
-    if "buildFeatures" in txt:
+            continue
+        txt = read_file(path)
+        if 'android:strokeColor=' not in txt:
+            log(f"  Warning: strokeColor attribute not found in {rel} — skipping.")
+            continue
         new = re.sub(
-            r'(buildFeatures\s*\{)',
-            r'\1\n        buildConfig = true',
+            r'android:strokeColor="[^"]*"',
+            f'android:strokeColor="{ICON_FG_COLOR}"',
             txt,
-            count=1,
         )
         if new != txt:
-            write_file(GRADLE_FILE, new)
-            log("  buildConfig = true injected into existing buildFeatures block.")
-            return
-
-    new = re.sub(
-        r'(android\s*\{)',
-        r'\1\n    buildFeatures {\n        buildConfig = true\n    }',
-        txt,
-        count=1,
-    )
-    if new != txt:
-        write_file(GRADLE_FILE, new)
-        log("  buildFeatures { buildConfig = true } block inserted.")
-    else:
-        log("  WARNING: Could not inject buildFeatures block. Manual check needed.")
+            write_file(path, new)
+            log(f"  Updated: {rel}")
+        else:
+            log(f"  Already correct ({ICON_FG_COLOR}): {rel}")
 
 
-# ── 4. アプリ名 ───────────────────────────────────────────────
-def write_app_name():
-    log(f"Writing app_name: {APP_NAME!r}...")
-    entry = f'<string name="app_name">{APP_NAME}</string>'
-
-    # values/ および values-xx/ 配下のすべての XML を対象に
-    # app_name エントリを APP_NAME に置換する。
-    # アプリ名は翻訳すべきでないため、全言語リソースで統一した値にする。
-    for root, _, files in os.walk(RES_DIR):
-        dirname = os.path.basename(root)
-        if not dirname.startswith("values"):
-            continue
-        for fname in files:
-            if not fname.endswith(".xml"):
-                continue
-            fp = os.path.join(root, fname)
-            try:
-                txt = read_file(fp)
-                if 'name="app_name"' not in txt:
-                    continue
-                new = re.sub(
-                    r'<string\s+name="app_name"[^>]*>[^<]*</string>',
-                    entry,
-                    txt,
-                )
-                if new != txt:
-                    write_file(fp, new)
-                    log(f"  Updated: {fp}")
-                else:
-                    log(f"  No change needed: {fp}")
-            except Exception as exc:
-                log(f"  Warning: {fp}: {exc}")
-
-    # values/strings.xml が存在しない場合は新規作成
-    os.makedirs(os.path.join(RES_DIR, "values"), exist_ok=True)
-    sp = os.path.join(RES_DIR, "values", "strings.xml")
-    if not os.path.exists(sp):
-        write_file(
-            sp,
-            f'<?xml version="1.0" encoding="utf-8"?>\n<resources>\n    {entry}\n</resources>',
-        )
-        log(f"  Created: {sp}")
-    elif 'name="app_name"' not in read_file(sp):
-        # strings.xml はあるが app_name がない場合は追記
-        txt = read_file(sp)
-        txt = re.sub(r"(<resources[^>]*>)", rf"\1\n    {entry}", txt, count=1)
-        write_file(sp, txt)
-        log(f"  app_name injected into {sp}")
-    log(f"  app_name = {APP_NAME!r} applied to all values resources.")
-
-
-# ── 5. AndroidManifest ────────────────────────────────────────
-def patch_manifest():
-    log(f"Patching {MANIFEST_FILE}...")
-    if not os.path.exists(MANIFEST_FILE):
-        die(f"Not found: {MANIFEST_FILE}")
-    txt = read_file(MANIFEST_FILE)
-    txt = re.sub(r'android:label="[^"]*"',  'android:label="@string/app_name"', txt)
-    txt = re.sub(r'android:icon="[^"]*"',   'android:icon="@mipmap/ic_launcher"', txt)
-    if "android:roundIcon=" in txt:
-        txt = re.sub(
-            r'android:roundIcon="[^"]*"',
-            'android:roundIcon="@mipmap/ic_launcher_round"',
-            txt,
-        )
-    else:
-        txt = txt.replace(
-            "<application",
-            '<application android:roundIcon="@mipmap/ic_launcher_round"',
-            1,
-        )
-    write_file(MANIFEST_FILE, txt)
-    log("  AndroidManifest patched.")
-
-
-# ── 6. MessageCodec.kt の修正 ─────────────────────────────────
-_MESSAGE_CODEC_SOURCE = '''\
+# ── 3. MessageCodec.kt の置き換え ────────────────────────────
+#
+# アップストリームの MessageCodec.kt は proto API
+# (com.metrolist.music.listentogether.proto.Listentogether) を使っているが、
+# .proto ファイルも protobuf gradle プラグインも存在しないためビルドが通らない。
+#
+# Protocol.kt は kotlinx.serialization の @Serializable クラスで定義されており、
+# MessageCodec.kt だけが proto API を使う不整合な状態になっている。
+#
+# 修正版: kotlinx.serialization + JSON エンコード/デコードに統一する。
+# インターフェース（encode/decode/decodePayload のシグネチャ）は維持し、
+# ListenTogetherClient.kt は無変更で動く。
+_MESSAGE_CODEC_REPLACEMENT = '''\
 /**
  * Metrolist Project (C) 2026
  * Licensed under GPL-3.0 | See git history for contributors
+ *
+ * [Patched by Metrolist Neo build system]
+ * Upstream MessageCodec.kt referenced proto-generated classes
+ * (com.metrolist.music.listentogether.proto.Listentogether) that do not
+ * exist in the source tree (no .proto files, no protobuf Gradle plugin).
+ * This replacement uses kotlinx.serialization / JSON, consistent with
+ * Protocol.kt, while keeping the same public API so ListenTogetherClient
+ * requires no changes.
  */
 
 package com.metrolist.music.listentogether
@@ -324,7 +272,12 @@ import java.util.zip.GZIPOutputStream
 
 /**
  * Codec for encoding and decoding ListenTogether wire messages.
- * Wire format: {"type":"<TYPE>","compressed":<bool>,"payload":"<JSON>"}
+ *
+ * Wire format (JSON):
+ *   { "type": "<TYPE>", "compressed": <bool>, "payload": "<JSON string>" }
+ *
+ * Compression is applied per-message when [compressionEnabled] is true and
+ * the serialised payload exceeds [COMPRESSION_THRESHOLD] bytes.
  */
 class MessageCodec(
     var compressionEnabled: Boolean = false
@@ -338,31 +291,45 @@ class MessageCodec(
         ignoreUnknownKeys = true
         encodeDefaults = false
         isLenient = true
+        coerceInputValues = true
     }
 
+    // ── Encode ────────────────────────────────────────────────
+
     fun encode(msgType: String, payload: Any?): ByteArray {
-        var payloadBytes = if (payload != null)
-            json.encodeToString(toJsonElement(payload)).toByteArray(Charsets.UTF_8)
-        else byteArrayOf()
+        var payloadBytes: ByteArray = if (payload != null) {
+            json.encodeToString(toJsonElement(payload))
+                .toByteArray(Charsets.UTF_8)
+        } else {
+            ByteArray(0)
+        }
 
         var compressed = false
         if (compressionEnabled && payloadBytes.size > COMPRESSION_THRESHOLD) {
             val c = compress(payloadBytes)
-            if (c.size < payloadBytes.size) { payloadBytes = c; compressed = true }
+            if (c.size < payloadBytes.size) {
+                payloadBytes = c
+                compressed = true
+            }
         }
 
-        return json.encodeToString(buildJsonObject {
+        val envelope = buildJsonObject {
             put("type", msgType)
             put("compressed", compressed)
-            put("payload", if (payloadBytes.isEmpty()) "" else payloadBytes.toString(Charsets.UTF_8))
-        }).toByteArray(Charsets.UTF_8)
+            put("payload", payloadBytes.toString(Charsets.UTF_8))
+        }
+        return json.encodeToString(envelope).toByteArray(Charsets.UTF_8)
     }
+
+    // ── Decode ────────────────────────────────────────────────
 
     fun decode(data: ByteArray): Pair<String, ByteArray> {
         val root       = json.parseToJsonElement(data.toString(Charsets.UTF_8)).jsonObject
-        val msgType    = root["type"]?.jsonPrimitive?.content ?: ""
-        val compressed = root["compressed"]?.jsonPrimitive?.content?.toBoolean() ?: false
-        var payload    = (root["payload"]?.jsonPrimitive?.content ?: "").toByteArray(Charsets.UTF_8)
+        val msgType    = root["type"]?.jsonPrimitive?.content.orEmpty()
+        val compressed = root["compressed"]?.jsonPrimitive?.content
+                             ?.toBooleanStrictOrNull() ?: false
+        var payload    = (root["payload"]?.jsonPrimitive?.content.orEmpty())
+                             .toByteArray(Charsets.UTF_8)
         if (compressed) payload = decompress(payload) ?: payload
         return Pair(msgType, payload)
     }
@@ -391,13 +358,18 @@ class MessageCodec(
                 MessageTypes.SUGGESTION_RECEIVED -> json.decodeFromJsonElement<SuggestionReceivedPayload>(el)
                 MessageTypes.SUGGESTION_APPROVED -> json.decodeFromJsonElement<SuggestionApprovedPayload>(el)
                 MessageTypes.SUGGESTION_REJECTED -> json.decodeFromJsonElement<SuggestionRejectedPayload>(el)
-                else -> null
+                else -> {
+                    Timber.tag(TAG).w("Unknown message type: %s", msgType)
+                    null
+                }
             }
         } catch (e: Exception) {
-            Timber.tag(TAG).e(e, "Failed to decode payload for type: $msgType")
+            Timber.tag(TAG).e(e, "Failed to decode payload for type: %s", msgType)
             null
         }
     }
+
+    // ── Private helpers ───────────────────────────────────────
 
     private fun toJsonElement(payload: Any): JsonElement = when (payload) {
         is CreateRoomPayload        -> json.encodeToJsonElement(payload)
@@ -434,63 +406,124 @@ class MessageCodec(
 '''
 
 
-def replace_message_codec():
+def replace_message_codec() -> None:
     log(f"Checking {MESSAGE_CODEC_PATH}...")
+
     if not os.path.exists(MESSAGE_CODEC_PATH):
         log("  Not found — skipping.")
         return
+
     existing = read_file(MESSAGE_CODEC_PATH)
-    if "Listentogether" in existing or "listentogether.proto" in existing:
-        write_file(MESSAGE_CODEC_PATH, _MESSAGE_CODEC_SOURCE)
-        log("  Replaced (was proto-based).")
-    else:
-        log("  Already up to date — no change.")
+
+    # proto API を使っているかどうかをチェック
+    needs_replace = (
+        "listentogether.proto" in existing
+        or "Listentogether." in existing
+        or "com.google.protobuf" in existing
+    )
+
+    if not needs_replace:
+        log("  Already up to date (no proto references) — skipping.")
+        return
+
+    write_file(MESSAGE_CODEC_PATH, _MESSAGE_CODEC_REPLACEMENT)
+    log("  Replaced (was proto-based → kotlinx.serialization).")
 
 
-# ── 7. gradle.properties ─────────────────────────────────────
-def patch_gradle_properties():
+# ── 4. gradle.properties ──────────────────────────────────────
+#
+# CI 環境向けの JVM・Gradle 設定をマージする。
+# 既存のキーは上書き、存在しないキーは末尾に追記。
+def patch_gradle_properties() -> None:
     log("Patching gradle.properties...")
-    desired = {
-        "org.gradle.jvmargs":
-            "-Xmx4096m -XX:MaxMetaspaceSize=1g -XX:+HeapDumpOnOutOfMemoryError -Dfile.encoding=UTF-8",
+    desired: dict[str, str] = {
+        "org.gradle.jvmargs": (
+            "-Xmx4096m -XX:MaxMetaspaceSize=1g "
+            "-XX:+HeapDumpOnOutOfMemoryError -Dfile.encoding=UTF-8"
+        ),
         "kotlin.daemon.jvmargs": "-Xmx4096m -XX:MaxMetaspaceSize=1g",
         "org.gradle.parallel":    "true",
-        "org.gradle.caching":     "true",
+        "org.gradle.caching":     "false",   # SNAPSHOT deps があるため false
         "android.enableJetifier": "false",
     }
-    path = "gradle.properties"
-    lines = open(path).readlines() if os.path.exists(path) else []
-    result, replaced = [], set()
+
+    prop_path = "gradle.properties"
+    lines: list[str] = []
+    if os.path.exists(prop_path):
+        with open(prop_path, encoding="utf-8") as f:
+            lines = f.readlines()
+
+    result: list[str] = []
+    replaced: set[str] = set()
+
     for line in lines:
-        s = line.strip()
-        if not s or s.startswith("#") or "=" not in s:
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#") or "=" not in stripped:
             result.append(line)
             continue
-        key = s.split("=", 1)[0].strip()
+        key = stripped.split("=", 1)[0].strip()
         if key in desired:
             result.append(f"{key}={desired[key]}\n")
             replaced.add(key)
         else:
             result.append(line)
+
     for k, v in desired.items():
         if k not in replaced:
             result.append(f"{k}={v}\n")
-    with open(path, "w") as f:
+
+    with open(prop_path, "w", encoding="utf-8") as f:
         f.writelines(result)
     log("  gradle.properties patched.")
+
+
+# ── 事前チェック ──────────────────────────────────────────────
+def preflight_checks() -> None:
+    """必須ファイル・ディレクトリの存在を確認する。"""
+    log("Running preflight checks...")
+
+    required = [
+        BASE_DIR,
+        RES_DIR,
+        os.path.join(BASE_DIR, "build.gradle.kts"),
+        os.path.join(BASE_DIR, "src/main/AndroidManifest.xml"),
+    ]
+    missing = [p for p in required if not os.path.exists(p)]
+    if missing:
+        die(
+            "Required paths not found. "
+            "Run this script from the project root.\n  "
+            + "\n  ".join(missing)
+        )
+
+    # resValue の仕組みが build.gradle.kts に存在するか確認
+    gradle_txt = read_file(os.path.join(BASE_DIR, "build.gradle.kts"))
+    if 'resValue("string", "app_name"' not in gradle_txt:
+        log(
+            "  WARNING: resValue(\"string\", \"app_name\", ...) not found in "
+            "build.gradle.kts.\n"
+            "  App name may not be applied. Check METROLIST_APP_NAME env var."
+        )
+    else:
+        log("  build.gradle.kts resValue check: OK")
+
+    log("  Preflight checks passed.")
 
 
 # ── Main ──────────────────────────────────────────────────────
 if __name__ == "__main__":
     try:
+        preflight_checks()
+        remove_app_name_xml()       # resValue との重複を防ぐ（最重要）
         patch_icon_colors()
-        patch_application_id()       # applicationId のみ変更、namespace は触らない
-        ensure_build_config_enabled()
-        write_app_name()
-        patch_manifest()
-        replace_message_codec()
+        replace_message_codec()     # proto → kotlinx.serialization
         patch_gradle_properties()
         log("All modifications applied successfully.")
+        log("")
+        log("NOTE: App name and applicationId are controlled via env vars:")
+        log("  METROLIST_APP_NAME       (default: Metrolist)")
+        log("  METROLIST_APPLICATION_ID (default: com.metrolist.music)")
+        log("Set these in the GitHub Actions workflow or local.properties.")
     except SystemExit:
         raise
     except Exception as exc:
